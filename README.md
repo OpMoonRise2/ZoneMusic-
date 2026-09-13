@@ -11,3 +11,4 @@ engine_music.signal
 The GitHub-generated source archives also contain these components.
 
 For the complete installation package, use the Nexus Mods release.
+https://www.nexusmods.com/finalfantasy11/mods/34
