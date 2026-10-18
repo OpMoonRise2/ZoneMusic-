@@ -1,5 +1,11 @@
 # ZoneMusic
 
+## Download the complete audio package
+
+**[Download ZoneMusic and its accompanying audio package on Nexus Mods](https://www.nexusmods.com/finalfantasy11/mods/34).**
+
+GitHub contains the addon source and documentation. To hear the supplied recordings, install the complete package from Nexus Mods; the GitHub source ZIP does not include the audio library.
+
 Dynamic zone and battle music for Ashita v4. Runtime version: 1.3.0.
 
 ## Install
