@@ -1,2 +1,23 @@
-sounds/
-engine_music.signal
+# User audio and local release assets belong in the separately distributed asset package.
+/sounds/
+/polplugins/
+/release-assets/
+# Runtime signals, personal settings, reports, backups and editor state.
+/engine_music.signal
+/voice_duck_signal.txt
+/config/
+/logs/
+/backup/
+**/BACKUP/
+**/_unused/
+*.bak
+*.bak-*
+*.orig
+*.old
+*.tmp
+*.log
+*.zip
+__pycache__/
+.DS_Store
+Thumbs.db
+.vscode/

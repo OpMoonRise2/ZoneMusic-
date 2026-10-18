@@ -1,14 +1,15 @@
-# ZoneMusic 1.2.1
+# ZoneMusic
 
-ZoneMusic is a dynamic music overhaul for Final Fantasy XI with 379 themed MP3 tracks covering zone ambience, day/night variations, solo and party battle music, notorious monsters, low HP, chocobo riding, fishing, Mog House music, and other contextual states.
-GitHub contains the ZoneMusic runtime components and source. The complete Ashita-ready package, including the 379-track MP3 library and XIPivot DAT replacements, is distributed through Nexus Mods due to GitHub's release asset size limit.
+Dynamic zone and battle music for Ashita v4. Runtime version: 1.3.0.
 
-Included here:
+## Install
 
-zonemusic.lua
-ZMHelper.dll
-engine_music.signal
-The GitHub-generated source archives also contain these components.
+Copy `zonemusic.lua`, `zm_ui.lua` and `zm_doctor.lua` to `Ashita/addons/zonemusic/`. Copy `ZMHelper.dll` to `Ashita/plugins/`. Put the separately supplied `sounds/` folder beside the Lua files, and the `zonemusicDATS` overlay under `Ashita/polplugins/DATs/`.
 
-For the complete installation package, use the Nexus Mods release.
-https://www.nexusmods.com/finalfantasy11/mods/34
+Add `zonemusicDATS` to your Pivot overlay list while preserving other entries. Load `/load ZMHelper` and `/addon load zonemusic`. Open the menu with `/zm`; run `/zm doctor` to inspect installation health.
+
+This prepared asset snapshot contains 427 MP3 recordings. The music library and DAT replacements are separate from the Git source bundle. The helper creates `engine_music.signal` at runtime; do not ship or track a signal captured from another session. Character settings, live configuration files, logs and backups are excluded.
+
+The deployed helper DLL is byte-identical to the current upstream binary. Its build source is not included in this repository snapshot.
+
+For the complete published installation package, use the [Nexus Mods release](https://www.nexusmods.com/finalfantasy11/mods/34).

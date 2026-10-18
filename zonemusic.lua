@@ -1,6 +1,6 @@
 addon.name      = 'ZoneMusic';
 addon.author    = 'MoonRise (Eldorin)';
-addon.version   = '1.2.1';
+addon.version   = '1.3.0';
 addon.desc      = 'Dynamic Zone Themes and Battle Themes /zm for gui';
 addon.link      = '';
 
@@ -9,6 +9,26 @@ local chat = require('chat');
 local ffi = require('ffi');
 local imgui = require('imgui');
 local settings = require('settings');
+
+-- The window lives in zm_ui.lua. A missing or broken copy must not take the
+-- music down with it, so the require is protected and a bare fallback
+-- window explains what happened instead.
+local zm_ui = (function()
+    local ok, mod = pcall(require, 'zm_ui');
+    if (ok and type(mod) == 'table' and mod.render ~= nil) then return mod; end
+    local reason = tostring(mod);
+    return {
+        load_error = reason,
+        render = function(ctx)
+            if (imgui.Begin('ZoneMusic##zm_fallback', ctx.gui_state.is_open)) then
+                imgui.TextColored({ 1.0, 0.55, 0.45, 1.0 }, 'The ZoneMusic window could not load (zm_ui.lua).');
+                imgui.TextWrapped('Music still works. Reinstall the addon so zm_ui.lua sits next to zonemusic.lua, then type /addon reload zonemusic.');
+                imgui.TextWrapped('Details: ' .. reason);
+            end
+            imgui.End();
+        end,
+    };
+end)();
 
 -- Seed math.random ONCE at addon load. Lua 5.1's PRNG starts in a fixed
 -- deterministic state per Lua state init; without an explicit seed, every
@@ -53,7 +73,7 @@ local default_settings = T{
     enable_nm = false,
     enable_lowhp = true,
     enable_fishing = true,  -- Play fishing music when "!" or "!!!" bite messages appear
-    enable_moghouse = true, -- Play Mog House music when a Moogle NPC is detected nearby
+    enable_moghouse = true, -- Play moghouse cover inside a Mog House (zone-in flag), native music126 silenced
     enable_chocobo = true,  -- Play chocobo music while mounted (Status == 5)
     battle_mode = 0,  -- 0 = Solo and Party (mixed), 1 = Force Solo, 2 = Force Party
     random_battle = false,  -- Random battle music from all available tracks
@@ -83,6 +103,10 @@ local default_settings = T{
     -- User-flagged cinematic zones (see is_cinematic_zone). Keyed by
     -- tostring(zone_id) = true. Extended via /zm cinema.
     cinematic_zones = {},
+    -- Zones where the player turned the addon off (native music plays).
+    -- Keyed by tostring(canonical zone id) = true, so one flag covers a
+    -- whole city group. Toggle with /zm zone or the jukebox switch.
+    disabled_zones = {},
     -- Pause WAV for 0x034-opened events (cutscene openers) after a short
     -- debounce, everywhere. NPC talks (0x032) never trigger this.
     -- Toggle in-game with /zm eventpause.
@@ -91,6 +115,131 @@ local default_settings = T{
 
 -- Load settings (returns live settings object)
 local music_config = settings.load(default_settings);
+
+-- Jukebox preview state, plus the addon's safety helpers. Kept in one table
+-- (more functions are attached further down, once the playback helpers
+-- exist) so the main chunk stays under the local-variable limit. While a
+-- preview is active the DJ is on hold and live music waits until it ends.
+local jukebox = {
+    alias = 'zm_preview',
+    active = false,
+    file = '',          -- catalog filename being previewed
+    label = '',         -- display name for the now-playing bar
+    length_ms = 0,
+    paused_zone = false, -- the preview paused live zone music and owes a resume
+    last_vol = -1,      -- set_volume dedupe
+    last_poll = 0,
+    catalog = nil,      -- built lazily the first time the window opens
+    ui = nil,           -- context table handed to zm_ui.render
+    errors = {},        -- source -> { count, first, last }, see report_error
+    quiet_until = os.clock() + 15,
+    settings_repairs = {},
+};
+
+-- Repair settings a hand-edited, truncated or very old settings file can
+-- break (a string where a number belongs, a volume of 5000, a table that
+-- became a number). Returns a list of what was fixed, shown by /zm doctor.
+function jukebox.sanitize_settings(cfg)
+    local fixed = {};
+    local function num(key, lo, hi, default)
+        local v = tonumber(cfg[key]);
+        if (v == nil) then
+            cfg[key] = default;
+            table.insert(fixed, string.format('%s was not a number; reset to %s', key, tostring(default)));
+        elseif (v < lo or v > hi) then
+            cfg[key] = math.max(lo, math.min(hi, v));
+            table.insert(fixed, string.format('%s was %s (allowed %s-%s); set to %s', key, tostring(v), tostring(lo), tostring(hi), tostring(cfg[key])));
+        else
+            cfg[key] = v;
+        end
+    end
+    local function flag(key, default)
+        if (type(cfg[key]) ~= 'boolean') then
+            cfg[key] = default;
+            table.insert(fixed, string.format('%s was not on/off; reset to %s', key, tostring(default)));
+        end
+    end
+    local function list(key)
+        if (type(cfg[key]) ~= 'table') then
+            cfg[key] = {};
+            table.insert(fixed, key .. ' was damaged; cleared');
+        end
+    end
+    num('volume', 0, 1000, 500);
+    num('low_hp_threshold', 1, 99, 25);
+    num('battle_delay', 0, 10, 3.0);
+    num('idle_replay_delay', 0, 3600, 0);
+    num('fade_duration', 0.1, 10, 1.5);
+    num('duck_percent', 0, 100, 35);
+    num('battle_resume_window', 10, 600, 60);
+    num('battle_mode', 0, 2, 0);
+    for _, key in ipairs({ 'enabled', 'enable_battle', 'enable_lowhp', 'enable_fade', 'enable_duck' }) do
+        flag(key, true);
+    end
+    list('disabled_zones');
+    list('zone_bgm');
+    list('cinematic_zones');
+    return fixed;
+end
+jukebox.settings_repairs = jukebox.sanitize_settings(music_config);
+
+-- The sounds folder, found through addon.path so a renamed addon folder
+-- (zonemusic-main, ZoneMusic (1), ...) keeps working. Falls back to the
+-- standard location if the path is not available.
+function jukebox.sounds_dir()
+    if (jukebox.sounds_cache ~= nil) then return jukebox.sounds_cache; end
+    local standard = AshitaCore:GetInstallPath() .. 'addons\\zonemusic\\sounds\\';
+    local found = standard;
+    if (addon ~= nil and type(addon.path) == 'string' and addon.path ~= '') then
+        -- Accept either the folder or the script's own path.
+        local base = addon.path:gsub('/', '\\'):gsub('[^\\]+%.lua$', ''):gsub('\\+$', '');
+        -- addon.path can arrive as 'C:\Ashita\\addons\...'; collapse the
+        -- doubled separator so reports and error messages read cleanly.
+        local candidate = (base .. '\\sounds\\'):gsub('\\+', '\\');
+        -- Trust it only if it actually holds music; otherwise keep the
+        -- standard location.
+        if (#jukebox.list_dir(candidate, '*.mp3') + #jukebox.list_dir(candidate, '*.wav') > 0) then
+            found = candidate;
+        end
+    end
+    jukebox.sounds_cache = found;
+    return found;
+end
+
+-- Log an error the first time a part of the addon fails, and tell the player
+-- once, instead of failing silently inside a pcall every frame.
+function jukebox.report_error(source, err)
+    local entry = jukebox.errors[source];
+    if (entry == nil) then
+        entry = { count = 0, first = tostring(err), announced = false };
+        jukebox.errors[source] = entry;
+        pcall(function()
+            local f = io.open(AshitaCore:GetInstallPath() .. 'logs\\zonemusic_errors.log', 'a');
+            if (f ~= nil) then
+                f:write(string.format('[%s] ZoneMusic %s | %s | %s\n',
+                    os.date('%Y-%m-%d %H:%M:%S'), tostring(addon.version), source, tostring(err)));
+                f:close();
+            end
+        end);
+    end
+    -- The first seconds after load see half-built game state (no player,
+    -- zoning); those land in the log only. Later failures are announced
+    -- once per source.
+    if (not entry.announced and os.clock() > jukebox.quiet_until) then
+        entry.announced = true;
+        print(chat.header('ZoneMusic'):append(chat.error(string.format(
+            'Something went wrong (%s). Music may misbehave. Type /zm doctor for help.', source))));
+    end
+    entry.count = entry.count + 1;
+    entry.last = tostring(err);
+end
+
+-- pcall that reports instead of swallowing.
+function jukebox.guard(source, fn, ...)
+    local ok, err = pcall(fn, ...);
+    if (not ok) then jukebox.report_error(source, err); end
+    return ok;
+end
 
 -- GUI state (initialized after settings load)
 local gui_state = {
@@ -137,6 +286,7 @@ local last_duck_update = 0;  -- For real dt calculation in update_ducking
 -- Register for settings updates (character change, etc.)
 settings.register('settings', 'zonemusic_settings_update', function(new_settings)
     music_config = new_settings;
+    jukebox.settings_repairs = jukebox.sanitize_settings(music_config);
     
     -- Update GUI state from loaded settings
     gui_state.enabled[1] = music_config.enabled;
@@ -164,6 +314,77 @@ ffi.cdef[[
     uint32_t mciSendStringA(const char* lpstrCommand, char* lpstrReturnString, uint32_t uReturnLength, void* hwndCallback);
 ]]
 local winmm = ffi.load('winmm');
+
+-- Each declaration is wrapped so a clash with another declaration cannot
+-- stop the addon from loading; the callers fall back when one is missing.
+pcall(ffi.cdef, [[
+    uint32_t mciGetErrorStringA(uint32_t error, char* text, uint32_t length);
+]]);
+pcall(ffi.cdef, [[
+    typedef struct { uint32_t lo; uint32_t hi; } ZM_FILETIME;
+    typedef struct {
+        uint32_t attributes;
+        ZM_FILETIME created; ZM_FILETIME accessed; ZM_FILETIME written;
+        uint32_t size_high; uint32_t size_low; uint32_t reserved0; uint32_t reserved1;
+        char name[260]; char alt_name[14];
+    } ZM_FIND_DATA;
+    void* FindFirstFileA(const char* pattern, ZM_FIND_DATA* data);
+    int FindNextFileA(void* handle, ZM_FIND_DATA* data);
+    int FindClose(void* handle);
+]]);
+
+-- Audio handles are per process, so an addon that crashed without unloading
+-- leaves them open and the next "open ... alias" fails. Close them first.
+for _, alias in ipairs({ 'bard_zone', 'bard_battle', 'zm_preview', 'zm_probe' }) do
+    winmm.mciSendStringA('close ' .. alias, nil, 0, nil);
+end
+
+-- Windows' own text for an MCI error code ("The specified file was not
+-- found", ...), so error messages mean something to players.
+function jukebox.mci_error(code)
+    local ok, text = pcall(function()
+        local buf = ffi.new('char[256]');
+        if (winmm.mciGetErrorStringA(code, buf, 256) ~= 0) then return ffi.string(buf); end
+        return nil;
+    end);
+    if (ok and text ~= nil and text ~= '') then
+        return string.format('%s (MCI %s)', text, tostring(code));
+    end
+    return 'MCI error ' .. tostring(code);
+end
+
+-- Files (or, with want_dirs, sub-folders) in dir matching pattern, as
+-- { name, size, mtime } with mtime a comparable number. Uses the Windows
+-- file API, which is fast and never flashes a console window; falls back to
+-- 'dir /b' (names only) if the FFI declarations are unavailable.
+function jukebox.list_dir(dir, pattern, want_dirs)
+    local out = {};
+    local ok = pcall(function()
+        local data = ffi.new('ZM_FIND_DATA[1]');
+        local handle = ffi.C.FindFirstFileA(dir .. pattern, data);
+        if (tonumber(ffi.cast('intptr_t', handle)) == -1) then return; end
+        repeat
+            local d = data[0];
+            local is_dir = bit.band(d.attributes, 0x10) ~= 0;
+            local name = ffi.string(d.name);
+            if (is_dir == (want_dirs == true) and name ~= '.' and name ~= '..') then
+                table.insert(out, {
+                    name = name,
+                    size = d.size_high * 4294967296 + d.size_low,
+                    mtime = d.written.hi * 4294967296 + d.written.lo,
+                });
+            end
+        until (ffi.C.FindNextFileA(handle, data) == 0);
+        ffi.C.FindClose(handle);
+    end);
+    if (ok) then return out; end
+    local handle = io.popen('dir /b ' .. (want_dirs and '/ad ' or '/a-d ') .. '"' .. dir .. pattern .. '" 2>nul');
+    if (handle ~= nil) then
+        for name in handle:lines() do table.insert(out, { name = name }); end
+        handle:close();
+    end
+    return out;
+end
 
 local current_track = "";
 local current_state = "Idle"; 
@@ -208,22 +429,14 @@ local FISHING_TIMEOUT = 60.0;        -- seconds before forcing exit if no resolu
 local FISHING_STATUS_GRACE = 5.0;
 local DEBUG_FISHING = false;         -- /zm fishingdebug to toggle
 
--- Mog House state — detected by scanning nearby entities for an NPC named
--- "Moogle" within MOGHOUSE_DISTANCE yalms. Inside a Mog House, your housekeeper
--- Moogle is always in the same room (5-10 yalms typical). Outside, you
--- aren't physically standing next to anything called "Moogle" — the
--- residential-area Moogle stops being a nearby entity once you exit the
--- Mog House interior because the engine unloads the interior model.
---
--- Rate-limited scan (MOGHOUSE_SCAN_INTERVAL) keeps the per-frame cost low.
--- Persistence flag with EXIT_GRACE prevents flicker if the Moogle entity
--- briefly de-syncs (e.g., during animation transitions).
+-- Mog House state. moghouse_active is set ONLY from the zone-in packet
+-- flag (0x00A offset 0x80 == 1 inside a Mog House; LSB writes 2 elsewhere)
+-- via jukebox.mh_enter, and cleared on the next zone-in without it. There
+-- is no Moogle proximity scan: Moogles out in the world never trigger it.
 local moghouse_active = false;
-local moghouse_last_seen = 0;        -- os.clock() of last successful Moogle detection
-local moghouse_scan_timer = 0;       -- os.clock() of last scan
-local MOGHOUSE_SCAN_INTERVAL = 1.0;  -- scan every 1 second
-local MOGHOUSE_DISTANCE = 12.0;      -- yalms — comfortably covers small Mog House interior
-local MOGHOUSE_EXIT_GRACE = 4.0;     -- seconds of no detection before clearing flag
+-- Mog House flag from the most recent zone-in packet: true = inside,
+-- false = not, nil = no zone-in seen since load.
+local moghouse_zone_flag = nil;
 local init_timer = 0;
 local init_complete = false; 
 
@@ -246,6 +459,18 @@ local last_seen_logged_in = 0;
 local LOGOUT_DEBOUNCE_NORMAL = 3.0;
 local LOGOUT_DEBOUNCE_ZONING = 30.0;
 local is_zoning = false;
+
+-- Same-city transit window. Opened on 0x00B when leaving a grouped zone,
+-- confirmed on 0x00A when the incoming zone is in the same group (cleared
+-- otherwise), and closed once the arrival settles. While open, an empty
+-- desired track is a loading glitch (player entity, party zone or HP not yet
+-- populated) and must not stop the WAV — stopping clears current_zone_track
+-- and forces a 0:00 restart. Unlike is_zoning, 0x00A does not clear it.
+local city_transit = {
+    group = nil,    -- city group being crossed; nil = no transit
+    dest = nil,     -- destination zone id from 0x00A (nil until it arrives)
+    started = 0,    -- os.clock() of the 0x00B that opened the window
+};
 
 -- Death state
 local is_dead = false;
@@ -283,7 +508,7 @@ local function scan_battle_tracks()
     random_battle_tracks_solo = {};
     random_battle_tracks_party = {};
     
-    local sounds_path = string.format('%saddons\\ZoneMusic\\sounds\\', AshitaCore:GetInstallPath());
+    local sounds_path = jukebox.sounds_dir();
     
     -- Shipping assets are MP3. Keep WAV discovery as a fallback so the
     -- lossless master archive remains usable without a separate Lua build.
@@ -411,6 +636,8 @@ local engine_signal = {
     last_counter = nil,  -- last seen counter (nil until baseline read)
     last_poll = 0,       -- os.clock() of last poll
     path = nil,          -- resolved on first poll
+    last_resilence = -1e9, -- os.clock() of last covered-track re-silence
+    resilence_interval = 2.0, -- min seconds between covered-track re-silences
 };
 local ENGINE_SIGNAL_POLL = 0.15; -- seconds between signal file reads
 local HANDOFF_END_GRACE = 1.0;      -- SS must stay non-4 this long before the
@@ -990,7 +1217,7 @@ local nm_list = {
     ["Ultima"]                      = true,  -- Sealion's Den (zone 32)
     ["Bahamut"]                     = true,  -- Monarch Linn (zone 31)
 
-    -- === HORIZON-SPECIFIC ===
+    -- === CUSTOM ===
     ["Highwind"]                    = true,
 };
 
@@ -1110,7 +1337,7 @@ local function resolve_audio_filename(filename)
     end
 
     for _, candidate in ipairs(candidates) do
-        local path = string.format('%saddons\\ZoneMusic\\sounds\\%s', AshitaCore:GetInstallPath(), candidate);
+        local path = jukebox.sounds_dir() .. candidate;
         local f = io.open(path, 'rb');
         if (f ~= nil) then
             io.close(f);
@@ -1353,11 +1580,23 @@ local expansion_enabled = {
     walkofechoes = false,   -- Walk of Echoes
 };
 
+-- Per-zone opt-out. Flags live on the canonical id so every district of a
+-- city group shares one switch; splitting them would fight the district
+-- continuity logic, which assumes the whole group plays one track.
+local function is_zone_disabled(zone_id)
+    if (zone_id == nil) then return false; end
+    local t = music_config.disabled_zones;
+    return (t ~= nil and t[tostring(get_canonical_zone(zone_id))] == true) or false;
+end
+
 -- Master coverage gate. Returns true if the addon should control
 -- audio in this zone; false = stay hands-off, engine plays.
 local function zone_is_covered_expansion(zone_id)
+    -- With the addon switched off it controls nothing, so zone-in leaves
+    -- the engine's music slots alone and event handling stays hands-off.
+    if (music_config.enabled == false) then return false; end
     local tag = zone_expansion[zone_id] or "base";
-    return expansion_enabled[tag] == true;
+    return expansion_enabled[tag] == true and not is_zone_disabled(zone_id);
 end
 
 -- Decide whether to suppress engine BGM for the given zone.
@@ -1669,21 +1908,9 @@ local function suppress_engine_bgm_in_zone_packet(e)
     local moghouse_flag = struct.unpack('b', e.data, 0x80 + 1);
     local entering_moghouse = (moghouse_flag ~= 0);
 
-    -- EXPANSION GATE: if this zone's expansion is not enabled (e.g. ToAU /
-    -- WotG [S] / SoA / Abyssea before their covers ship), the addon stays
-    -- fully hands-off — never suppress the engine, so native BGM plays.
-    if (not zone_is_covered_expansion(incoming_zone_id)) then
-        return;
-    end
-
-    local should_suppress = has_zonemusic_assets(incoming_zone_id)
-                         or (entering_moghouse and file_exists("moghouse.wav"));
-
-    if (not should_suppress) then
-        return;
-    end
-
-    -- Preserve the engine's original resident music IDs before zeroing.
+    -- Always record the engine's resident music IDs, even in zones the addon
+    -- leaves alone. A zone the player disabled needs them later if it gets
+    -- re-enabled mid-zone (and vice versa, to hand the engine its music back).
     pcall(function()
         saved_bgm_ids.day   = struct.unpack('H', e.data, ENGINE_BGM_OFFSETS.day   + 1);
         saved_bgm_ids.night = struct.unpack('H', e.data, ENGINE_BGM_OFFSETS.night + 1);
@@ -1694,6 +1921,20 @@ local function suppress_engine_bgm_in_zone_packet(e)
 
     -- Persist the fresh capture (see store_zone_bgm comment).
     pcall(store_zone_bgm, incoming_zone_id);
+
+    -- EXPANSION / PER-ZONE GATE: if this zone's expansion is not enabled, or
+    -- the player switched the addon off here, stay fully hands-off — never
+    -- suppress the engine, so native BGM plays.
+    if (not zone_is_covered_expansion(incoming_zone_id)) then
+        return;
+    end
+
+    local should_suppress = has_zonemusic_assets(incoming_zone_id)
+                         or (entering_moghouse and file_exists("moghouse.wav"));
+
+    if (not should_suppress) then
+        return;
+    end
 
     ashita.bits.pack_be(e.data_modified_raw, 0, ENGINE_BGM_OFFSETS.day,   0, 16);
     ashita.bits.pack_be(e.data_modified_raw, 0, ENGINE_BGM_OFFSETS.night, 0, 16);
@@ -1718,10 +1959,12 @@ local function get_desired_track()
     -- EXPANSION GATE: in a zone whose expansion isn't enabled, the addon plays
     -- nothing — the engine owns audio. Returning "" keeps MCI silent here.
     if (not zone_is_covered_expansion(zone_id)) then
-        current_state = "Idle (Game Music)";
+        current_state = is_zone_disabled(zone_id)
+            and "Idle (Game Music - addon off in this zone)"
+            or "Idle (Game Music)";
         return "";
     end
-    
+
     -- === PARTY BATTLE DETECTION ===
     local party_size = 0;
     local party_server_ids = {};
@@ -1958,66 +2201,14 @@ local function get_desired_track()
     end
 
     -- === PRIORITY 1.7: MOG HOUSE ===
-    -- Detected by scanning nearby entities for an NPC named exactly "Moogle"
-    -- within MOGHOUSE_DISTANCE yalms. Every Mog House and Rent-a-Room has
-    -- a housekeeper Moogle (verified across all four nation cities per
-    -- BG Wiki / FFXIclopedia NPC naming).
-    --
-    -- WHY THIS WORKS:
-    --   - Inside any Mog House, the Moogle is in the room with you (5-10y).
-    --   - Outside Mog Houses, the Mog House interior is unloaded — the
-    --     Moogle is not in your entity scan range, even when you're standing
-    --     just outside the residential area door.
-    --   - Nomad Moogles (Selbina, Mhaura, Norg, Rabao, Kazham, etc.) are in
-    --     different zones and named differently from a strict-equality
-    --     standpoint? Actually no, they are also named "Moogle". This is a
-    --     known concern: standing next to a Nomad Moogle for >1 second would
-    --     trigger Mog House music. Mitigations:
-    --     (a) Outdoor Nomad Moogle zones (Selbina, Mhaura, etc.) don't
-    --         typically share city-music architecture with Mog House music,
-    --         and the user-controlled enable_moghouse toggle lets the user
-    --         disable it when traveling.
-    --     (b) MOGHOUSE_SCAN_INTERVAL=1.0 + EXIT_GRACE=4.0 means you have to
-    --         dwell next to a Nomad Moogle for ~5 sec before music kicks in,
-    --         and music ends within ~5 sec of walking away.
-    --
-    -- Rate-limited via moghouse_scan_timer to avoid scanning every frame.
-    if (music_config.enable_moghouse) then
-        local now = os.clock();
-        if (now - moghouse_scan_timer >= MOGHOUSE_SCAN_INTERVAL) then
-            moghouse_scan_timer = now;
-            local moogle_found = false;
-            local success, _ = pcall(function()
-                for j = 0, 2303 do
-                    local ent = GetEntity(j);
-                    if (ent ~= nil and ent.Name == "Moogle") then
-                        -- Distance is squared yalms; threshold compares squared
-                        -- to avoid the sqrt cost on every entity.
-                        if (ent.Distance ~= nil and ent.Distance > 0 and
-                            ent.Distance <= (MOGHOUSE_DISTANCE * MOGHOUSE_DISTANCE)) then
-                            moogle_found = true;
-                            return;
-                        end
-                    end
-                end
-            end);
-            if (success and moogle_found) then
-                moghouse_last_seen = now;
-                if (not moghouse_active) then
-                    moghouse_active = true;
-                end
-            elseif (moghouse_active) then
-                -- No Moogle in range this scan; check exit grace
-                if ((now - moghouse_last_seen) > MOGHOUSE_EXIT_GRACE) then
-                    moghouse_active = false;
-                end
-            end
-        end
-
-        if (moghouse_active and file_exists("moghouse.wav")) then
-            current_state = "Mog House";
-            return "moghouse.wav";
-        end
+    -- Inside a Mog House ONLY. moghouse_active is driven solely by the
+    -- zone-in packet flag (0x00A offset 0x80 == 1, see jukebox.mh_enter):
+    -- the Mog House has no zone id of its own, and NPCs named "Moogle"
+    -- (Nomad Moogles, city Moogles) never trigger it. The city theme stays
+    -- paused underneath and resumes from its position on exit.
+    if (music_config.enable_moghouse and moghouse_active and file_exists("moghouse.wav")) then
+        current_state = "Mog House";
+        return "moghouse.wav";
     end
 
     -- === PRIORITY 1.8: CHOCOBO MOUNT ===
@@ -2437,6 +2628,7 @@ local idle_replay = {
 -- battle (stopped) cases.
 local mci_owned_before_event = false;
 
+
 -- Set volume directly on an alias
 local function set_volume(alias, vol)
     -- Clamp to valid MCI range. CRITICAL: MCI's `setaudio volume` accepts
@@ -2462,6 +2654,9 @@ local function set_volume(alias, vol)
     elseif (alias == battle_alias) then
         if (int_vol == last_sent_battle_vol) then return; end
         last_sent_battle_vol = int_vol;
+    elseif (alias == jukebox.alias) then
+        if (int_vol == jukebox.last_vol) then return; end
+        jukebox.last_vol = int_vol;
     end
 
     local volume_cmd = string.format('setaudio %s volume to %d', alias, int_vol);
@@ -2479,6 +2674,9 @@ local function apply_volumes()
     end
     if (battle_is_playing) then
         set_volume(battle_alias, battle_current_vol * duck_current_vol);
+    end
+    if (jukebox.active) then
+        set_volume(jukebox.alias, music_config.volume * duck_current_vol);
     end
 end
 
@@ -2764,6 +2962,36 @@ local function resume_zone_music_fast()
     end
 end
 
+-- True while the Mog House cover owns audio. The city track is paused under
+-- moghouse.wav (battle channel) for the whole stay; nothing may resume it.
+function jukebox.moghouse_owns_audio()
+    return (music_config.enable_moghouse ~= false) and moghouse_active
+        and file_exists("moghouse.wav");
+end
+
+-- A track the engine starts that the addon already covers in a zone it owns:
+-- the zone's resident day/night theme, or Mog House track 126 when the
+-- moghouse.wav cover is in use. Mirrors the 0x05F handler's resident/covered
+-- block so the ZMHelper signal poll classifies engine starts the same way.
+function jukebox.is_covered_engine_track(song)
+    if (song == nil or song <= 0) then return false; end
+    local addon_owns_zone = false;
+    pcall(function()
+        addon_owns_zone = zone_is_covered_expansion(
+            AshitaCore:GetMemoryManager():GetParty():GetMemberZone(0));
+    end);
+    if (not addon_owns_zone) then return false; end
+    local rd, rn = saved_bgm_ids.day, saved_bgm_ids.night;
+    if (((rd ~= nil) and (song == rd)) or ((rn ~= nil) and (song == rn))) then
+        return true;
+    end
+    if (moghouse_zone_flag == true and song == jukebox.mh_native_song) then
+        return (music_config.enable_moghouse ~= false) and file_exists("moghouse.wav");
+    end
+    return (song == 126) and (music_config.enable_moghouse ~= false)
+        and file_exists("moghouse.wav");
+end
+
 -- End of an engine handoff: resume the WAV first (instant, full volume),
 -- then re-silence the engine's slots so its lingering event track does not
 -- ride under the WAV. Resume-before-silence closes the dead-air gap that the
@@ -2771,7 +2999,9 @@ end
 -- engine_silence() is still gated on mci_owned_before_event, so engine-only
 -- zones (no WAV cover) are left untouched.
 local function end_handoff(resume_wav)
-    if (resume_wav and zone_is_paused) then
+    -- Inside a Mog House the city track is parked under moghouse.wav; the
+    -- next update_music tick restarts moghouse.wav instead.
+    if (resume_wav and zone_is_paused and not jukebox.moghouse_owns_audio()) then
         resume_zone_music_fast();
     end
     engine_silence();
@@ -2792,6 +3022,9 @@ end
 -- that never touches the wire).
 local function begin_handoff(reason)
     if (handoff.active) then return; end
+    -- Event music wins over a jukebox preview. Stop it without resuming live
+    -- music; the handoff below decides what happens to the zone track.
+    if (jukebox.active) then jukebox.stop(false); end
     handoff.active = true;
     handoff.started = os.clock();
     handoff.saw_event = false;
@@ -2851,12 +3084,61 @@ local function poll_engine_signal()
 
     if (counter ~= engine_signal.last_counter) then
         engine_signal.last_counter = counter;
+        -- The game re-opens a playing track every fraction of a second, so
+        -- this doubles as "the game is streaming music right now".
+        engine_signal.last_change = now;
+        engine_signal.last_music = music_id;
+        -- Logged in every zone (not only ones the addon controls) so a
+        -- silent fight can be traced to the exact track the game started.
+        if (DEBUG_CUTSCENE) then
+            local zid = 0;
+            pcall(function() zid = AshitaCore:GetMemoryManager():GetParty():GetMemberZone(0) or 0; end);
+            zm_debug(string.format('Engine started music %d (zone %d)', music_id, zid));
+        end
         -- Track 0 is the engine's silence slot; ignore.
         if (music_id == 0) then return; end
         -- Only react when the WAV actually owns audio here; engine-native
         -- zones (no cover / DAT-swapped boss fights) are the engine's turf.
         if (handoff.active) then return; end
         if (zone_is_playing or zone_is_paused or battle_is_playing) then
+            -- A track the WAV already covers is not event music: the 0x05F
+            -- handler blocks the same ids. Handing off for one paused the
+            -- WAV, orphan-timed out 4s later, resumed the CITY track (even
+            -- inside a Mog House), and the next counter change repeated it.
+            -- Mog House 126 is exempt always; the resident theme only
+            -- outside an event window, so scored cutscenes (SS=4) and
+            -- cinematic zones keep handing off exactly as before.
+            if (jukebox.is_covered_engine_track(music_id)) then
+                local in_event = false;
+                pcall(function()
+                    local pe = GetPlayerEntity();
+                    in_event = (pe ~= nil and (pe.StatusServer or 0) == 4)
+                        or is_cinematic_zone(AshitaCore:GetMemoryManager():GetParty():GetMemberZone(0));
+                end);
+                local mh_track = (music_id == 126)
+                    or (moghouse_zone_flag == true and music_id == jukebox.mh_native_song);
+                if (mh_track or not in_event) then
+                    -- Keep the WAV; re-silence the engine's day/night slots
+                    -- (what end_handoff did after the 4s detour), at most
+                    -- once per engine_signal.resilence_interval.
+                    if ((now - engine_signal.last_resilence) >= engine_signal.resilence_interval) then
+                        engine_signal.last_resilence = now;
+                        if (mh_track) then
+                            -- Native Mog House theme: it lives in block 6
+                            -- (also catches a reload inside a Mog House,
+                            -- where no zone-in flag has been seen yet).
+                            jukebox.mh_silence_slot();
+                        else
+                            inject_engine_music(0, ENGINE_SILENCE_ID);
+                            inject_engine_music(1, ENGINE_SILENCE_ID);
+                        end
+                    end
+                    if (DEBUG_CUTSCENE) then
+                        zm_debug(string.format('Engine music %d is covered by the WAV - no handoff', music_id));
+                    end
+                    return;
+                end
+            end
             begin_handoff(string.format('engine opened music %d (ZMHelper)', music_id));
         end
     end
@@ -2902,14 +3184,14 @@ local function play_zone_music(track)
         print(chat.header('ZoneMusic'):append(chat.error('Zone music asset missing: ' .. track)));
         return;
     end
-    local path = string.format('%saddons\\ZoneMusic\\sounds\\%s', AshitaCore:GetInstallPath(), resolved_track);
+    local path = jukebox.sounds_dir() .. resolved_track;
     local mci_type = get_mci_type(resolved_track);
     
     local open_cmd = string.format('open "%s" type %s alias %s', path, mci_type, zone_alias);
     local result = winmm.mciSendStringA(open_cmd, nil, 0, nil);
     
     if (result ~= 0) then
-        print(chat.header('ZoneMusic'):append(chat.error('Zone music open failed! Error: ' .. result)));
+        print(chat.header('ZoneMusic'):append(chat.error('Zone music could not open ' .. resolved_track .. ': ' .. jukebox.mci_error(result))));
         return;
     end
     
@@ -2924,7 +3206,7 @@ local function play_zone_music(track)
     result = winmm.mciSendStringA(play_cmd, nil, 0, nil);
     
     if (result ~= 0) then
-        print(chat.header('ZoneMusic'):append(chat.error('Zone music play failed! Error: ' .. result)));
+        print(chat.header('ZoneMusic'):append(chat.error('Zone music could not play ' .. resolved_track .. ': ' .. jukebox.mci_error(result))));
         winmm.mciSendStringA("close " .. zone_alias, nil, 0, nil);
         return;
     end
@@ -3011,7 +3293,7 @@ local function play_battle_music(track)
         print(chat.header('ZoneMusic'):append(chat.error('Battle music asset missing: ' .. track)));
         return;
     end
-    local path = string.format('%saddons\\ZoneMusic\\sounds\\%s', AshitaCore:GetInstallPath(), resolved_track);
+    local path = jukebox.sounds_dir() .. resolved_track;
     local mci_type = get_mci_type(resolved_track);
     
     local open_cmd = string.format('open "%s" type %s alias %s', path, mci_type, battle_alias);
@@ -3298,9 +3580,77 @@ local function debug_log_status(status, status_server, animation)
     end
 end
 
+-- update_music sits at LuaJIT's 60-upvalue limit, so state it touches only
+-- through these helpers lives here instead of being captured there.
+
+-- Clear event/cutscene tracking. Shared by the logout paths in update_music.
+function jukebox.reset_event_tracking()
+    status4_start_time = 0;
+    in_cutscene_from_packet = false;
+    packet_event_pending_start = 0;
+    was_in_cutscene = false;
+    handoff.active = false;
+    handoff.saw_event = false;
+    handoff.end_grace = 0;
+    handoff.started = 0;
+    handoff.pending034 = 0;
+end
+
+-- Close the same-city transit window. On logout also forget Mog House state
+-- so the next character starts clean.
+function city_transit.clear(logout)
+    city_transit.group = nil;
+    city_transit.dest = nil;
+    if (logout) then
+        moghouse_zone_flag = nil;
+        moghouse_active = false;
+    end
+end
+
+-- SAME-CITY TRANSIT HOLD: between 0x00B and a settled arrival in the same
+-- city group, an empty desired track means loading data is not ready yet
+-- (entity, party zone, or HP% reading 0 -> false death). Returns true to
+-- hold the WAV. The window settles once the entity is back in the 0x00A zone
+-- with HP > 0, on real death status, or after LOGOUT_DEBOUNCE_ZONING; after
+-- that an empty track is a real yield and update_music handles it.
+function city_transit.hold(player_ent, party, zone_id)
+    if (city_transit.group == nil) then return false; end
+    local settled = false;
+    pcall(function()
+        if (player_ent ~= nil) then
+            local st = player_ent.Status or 0;
+            if (st == 2 or st == 3) then
+                settled = true;
+            elseif (city_transit.dest ~= nil and zone_id == city_transit.dest
+                and (party:GetMemberHPPercent(0) or 0) > 0) then
+                settled = true;
+            end
+        end
+    end);
+    if (DEBUG_CITY or DEBUG_CUTSCENE) then
+        zm_debug(string.format('CITY transit "" zone=%s dest=%s settled=%s state=%s',
+            tostring(zone_id), tostring(city_transit.dest),
+            tostring(settled), tostring(current_state)));
+    end
+    if ((not settled) and (os.clock() - city_transit.started) < LOGOUT_DEBOUNCE_ZONING) then
+        return true;
+    end
+    city_transit.clear(false);
+    return false;
+end
+
+-- A real track in the destination zone closes the transit window.
+function city_transit.arrive(zone_id)
+    if (city_transit.group ~= nil and city_transit.dest ~= nil
+        and zone_id == city_transit.dest) then
+        city_transit.clear(false);
+    end
+end
+
 local function update_music()
     if (not music_config.enabled) then
         stop_all_music();
+        jukebox.mh_release();  -- native Mog House music returns with the addon off
         current_state = "Disabled";
         return;
     end
@@ -3416,19 +3766,12 @@ local function update_music()
             if (zone_is_playing or zone_is_paused or battle_is_playing) then
                 stop_all_music_instant();
             end
-            status4_start_time = 0;
-            in_cutscene_from_packet = false;
-            packet_event_pending_start = 0;
-            was_in_cutscene = false;
-            handoff.active = false;
-            handoff.saw_event = false;
-            handoff.end_grace = 0;
-            handoff.started = 0;
-    handoff.pending034 = 0;
+            jukebox.reset_event_tracking();
             previous_status = 0;
             previous_is_night = nil;
             is_zoning = false;
             zoning_from_city = nil;
+            city_transit.clear(true);
             current_state = "Logged Out";
             return;
         end
@@ -3439,6 +3782,11 @@ local function update_music()
     -- addon music here and skip the rest of the track-selection branches,
     -- which expect a non-empty filename.
     if (desired_track == nil or desired_track == "") then
+        -- Same-city transit: hold through loading glitches (see city_transit.hold).
+        if (city_transit.hold(player_ent_check, party, current_zone_id)) then
+            return;
+        end
+
         -- LOGOUT DEBOUNCE: if player_ent is nil, this could be either a
         -- real logout OR a transient gap during zoning. Hold music for
         -- LOGOUT_DEBOUNCE seconds before treating it as a real stop.
@@ -3510,26 +3858,21 @@ local function update_music()
             -- Similarly previous_is_night and previous_status track
             -- player state that should reset on real logout — those
             -- still clear.
-            status4_start_time = 0;
-            in_cutscene_from_packet = false;
-            packet_event_pending_start = 0;
-            was_in_cutscene = false;
-            handoff.active = false;
-            handoff.saw_event = false;
-            handoff.end_grace = 0;
-            handoff.started = 0;
-    handoff.pending034 = 0;
+            jukebox.reset_event_tracking();
             previous_status = 0;
             previous_is_night = nil;
             -- Zoning flag clears on confirmed logout. If a real zone-in
             -- (0x00A) ever arrives later it'll just be a no-op set to false.
             is_zoning = false;
+            city_transit.clear(false);
         end
         if (zone_is_playing or zone_is_paused or battle_is_playing) then
             stop_all_music_instant();
         end
         return;
     end
+
+    city_transit.arrive(current_zone_id);
 
     -- Get current time for day/night change detection
     local vana_hour = get_vana_hour();
@@ -3690,24 +4033,1404 @@ local function update_music()
     current_track = desired_track;
 end
 
+-- Hand the zone's native tracks back to the engine: all five slots, exactly
+-- as the zone packet carried them (a slot never captured is left alone
+-- rather than forced to silence). Returns false when this zone's ids were
+-- never captured, so the caller can say music returns on the next zone-in.
+function jukebox.release_engine(zid)
+    if (saved_bgm_ids.day == nil) then load_zone_bgm(zid); end
+    if (saved_bgm_ids.day == nil) then return false; end
+    local slots = { 'day', 'night', 'solo', 'party', 'mount' };
+    for slot = 0, 4 do
+        local id = saved_bgm_ids[slots[slot + 1]];
+        if (id ~= nil) then pcall(inject_engine_music, slot, id); end
+    end
+    return true;
+end
+
+-- Silence all five engine slots so the addon's own track owns audio,
+-- the same state a zone-in leaves behind in a covered zone.
+function jukebox.silence_engine()
+    for slot = 0, 4 do
+        pcall(inject_engine_music, slot, ENGINE_SILENCE_ID);
+    end
+end
+
+-- === MOG HOUSE MUSIC SLOT ===
+-- The client keeps a dedicated Mog House music slot (0x05F block 6; LSB
+-- setmusic.lua: "6=Moghouse", also what Symphonic Curator rewrites) and
+-- starts it ITSELF whenever the zone-in packet flags a Mog House. The server
+-- never sends music126 and the zone packet's slots 0-4 don't carry it, so
+-- zeroing those never touched it: music126.bgw played under moghouse.wav.
+-- While the cover owns the room, block 6 is set to silence; it is restored
+-- on exit, when the feature is switched off, and on unload.
+jukebox.MH_SLOT = 6;
+jukebox.mh_native_song = 126;   -- last real block-6 track (126 unless the server set another)
+jukebox.mh_slot_silenced = false;
+
+-- Cover can own the Mog House in zone `zid`: feature on, asset present,
+-- addon active in the parent city.
+function jukebox.mh_cover_ready(zid)
+    return (music_config.enable_moghouse ~= false) and file_exists("moghouse.wav")
+        and zone_is_covered_expansion(zid);
+end
+
+function jukebox.mh_silence_slot()
+    pcall(inject_engine_music, jukebox.MH_SLOT, ENGINE_SILENCE_ID);
+    jukebox.mh_slot_silenced = true;
+end
+
+function jukebox.mh_release()
+    if (not jukebox.mh_slot_silenced) then return; end
+    pcall(inject_engine_music, jukebox.MH_SLOT, jukebox.mh_native_song or 126);
+    jukebox.mh_slot_silenced = false;
+end
+
+-- Keep block 6 silent ahead of time. Silencing only on entry lets the client
+-- start music126 first (two notes audible before the injected 0x05F lands),
+-- so whenever the cover is usable the slot stays silenced: at load, on every
+-- zone-in, and on exit. Block 6 is only heard inside a Mog House.
+function jukebox.mh_prime()
+    if ((music_config.enable_moghouse ~= false) and file_exists("moghouse.wav")) then
+        jukebox.mh_silence_slot();
+    end
+end
+
+-- Inside a Mog House (zone-in flag): hand the room to the cover immediately,
+-- no Moogle scan needed, and silence the native slot.
+function jukebox.mh_enter(zid)
+    if (not jukebox.mh_cover_ready(zid)) then
+        -- No cover here (e.g. addon off in this city): the primed silence
+        -- would leave the room mute, so give the native theme back.
+        jukebox.mh_release();
+        return;
+    end
+    moghouse_active = true;
+    jukebox.mh_silence_slot();
+    if (DEBUG_CUTSCENE) then
+        zm_debug(string.format('Mog House entered (zone %s) - cover owns audio, block 6 silenced', tostring(zid)));
+    end
+end
+
+-- Re-apply ownership after the feature toggle changes mid-visit.
+function jukebox.mh_sync()
+    if (moghouse_zone_flag ~= true) then
+        if (music_config.enable_moghouse == false) then
+            moghouse_active = false;
+            jukebox.mh_release();
+        else
+            jukebox.mh_prime();
+        end
+        return;
+    end
+    local zid = 0;
+    pcall(function() zid = AshitaCore:GetMemoryManager():GetParty():GetMemberZone(0); end);
+    if (jukebox.mh_cover_ready(zid)) then
+        jukebox.mh_enter(zid);
+    else
+        moghouse_active = false;
+        jukebox.mh_release();
+    end
+end
+
+-- Battle-music watchdog for zones the game scores itself (the addon is not
+-- driving audio there). When an event track is still playing as a fight
+-- starts, the game can drop it without starting the battle slot, leaving
+-- the fight silent. Seen in Empyreal Paradox: Dusk and Dawn plays through
+-- the entry cutscene, stops at the engage, and phase 1 has no music, even
+-- though the zone's battle slots hold that same track. If the game streams
+-- nothing for 2 s after the player engages, re-send the zone's battle slots
+-- once; the game then starts its battle music. A fight that already has
+-- music (Promathia phase 2 keeps A Realm of Emptiness streaming) is never
+-- touched. Needs ZMHelper, which is what reports the streaming.
+jukebox.BATTLE_WATCHDOG_QUIET = 2.0;
+function jukebox.battle_watchdog()
+    local now = os.clock();
+    if ((now - (jukebox.bw_poll or 0)) < 0.25) then return; end
+    jukebox.bw_poll = now;
+
+    local player = GetPlayerEntity();
+    local engaged = (player ~= nil and player.Status == 1);
+    if (not engaged) then
+        jukebox.bw_engaged_at = nil;
+        jukebox.bw_kicked = false;
+        return;
+    end
+    if (not music_config.enabled or not engine_signal.present or jukebox.active) then return; end
+
+    local zid = AshitaCore:GetMemoryManager():GetParty():GetMemberZone(0) or 0;
+    if (jukebox.ui ~= nil and jukebox.ui.owns_zone(zid)) then return; end  -- the addon plays here
+
+    if (jukebox.bw_engaged_at == nil) then
+        jukebox.bw_engaged_at = now;
+        return;
+    end
+    if (jukebox.bw_kicked) then return; end
+    local quiet_for = now - (engine_signal.last_change or 0);
+    if ((now - jukebox.bw_engaged_at) < jukebox.BATTLE_WATCHDOG_QUIET or quiet_for < jukebox.BATTLE_WATCHDOG_QUIET) then
+        return;
+    end
+
+    jukebox.bw_kicked = true;
+    local solo, party = saved_bgm_ids.solo, saved_bgm_ids.party;
+    if ((solo or 0) == 0 and (party or 0) == 0) then return; end  -- zone has no battle music
+    if ((solo or 0) ~= 0) then pcall(inject_engine_music, 2, solo); end
+    if ((party or 0) ~= 0) then pcall(inject_engine_music, 3, party); end
+    if (DEBUG_CUTSCENE) then
+        zm_debug(string.format('Battle watchdog: game silent %.1fs into a fight in zone %d, re-sent battle slots (solo=%s party=%s)',
+            quiet_for, zid, tostring(solo), tostring(party)));
+    end
+end
+
+-- Flip the per-zone opt-out and apply it right away if the player is
+-- standing in an affected zone. Disabling hands the engine its own resident
+-- tracks back (slots were zeroed at zone-in); enabling silences them again
+-- the same way the init block does, then lets the DJ pick up.
+local function set_zone_disabled(zone_id, disabled)
+    if (zone_id == nil or zone_id == 0) then return; end
+    if (music_config.disabled_zones == nil) then music_config.disabled_zones = {}; end
+    local key = tostring(get_canonical_zone(zone_id));
+    music_config.disabled_zones[key] = disabled and true or nil;
+    pcall(settings.save);
+
+    local here = AshitaCore:GetMemoryManager():GetParty():GetMemberZone(0);
+    local affects_here = (here ~= nil and here ~= 0
+        and get_canonical_zone(here) == get_canonical_zone(zone_id));
+
+    if (affects_here) then
+        if (saved_bgm_ids.day == nil) then load_zone_bgm(here); end
+        if (disabled) then
+            -- Fade the cover out while the engine's own track comes back in.
+            stop_all_music();
+            jukebox.release_engine(here);
+        elseif (zone_is_covered_expansion(here) and has_zonemusic_assets(here)) then
+            jukebox.silence_engine();
+            if (not jukebox.active) then pcall(update_music); end
+        end
+    end
+
+    local name = AshitaCore:GetResourceManager():GetString('zones.names', zone_id) or ('Zone ' .. zone_id);
+    local msg = disabled
+        and string.format('Addon music OFF in %s. Game music plays there.', name)
+        or  string.format('Addon music ON in %s.', name);
+    if (affects_here and disabled and saved_bgm_ids.day == nil) then
+        msg = msg .. ' Game music returns on your next zone-in.';
+    end
+    print(chat.header('ZoneMusic'):append(chat.message(msg)));
+end
+
+-- /zm zone [on|off|toggle|list]. Kept out of the command handler so that
+-- closure stays clear of the upvalue limit.
+local function handle_zone_command(args)
+    local here = AshitaCore:GetMemoryManager():GetParty():GetMemberZone(0);
+    local sub = args[3] or 'toggle';
+    if (sub == 'list') then
+        local count = 0;
+        for key, flag in pairs(music_config.disabled_zones or {}) do
+            if (flag == true) then
+                local zid = tonumber(key) or 0;
+                print(chat.header('ZoneMusic'):append(chat.message(string.format('  %d  %s', zid,
+                    AshitaCore:GetResourceManager():GetString('zones.names', zid) or '?'))));
+                count = count + 1;
+            end
+        end
+        if (count == 0) then
+            print(chat.header('ZoneMusic'):append(chat.message('No zones are switched off.')));
+        end
+    elseif (sub == 'off') then
+        set_zone_disabled(here, true);
+    elseif (sub == 'on') then
+        set_zone_disabled(here, false);
+    else
+        set_zone_disabled(here, not is_zone_disabled(here));
+    end
+end
+
+-- Body of the settings tab (the pre-jukebox window pages). Lives outside
+-- the render tick so neither closure hits the upvalue limit; the Crystal
+-- shell in zm_ui.lua calls it with the page index and content width.
+local function render_settings_page(page, CONTENT_W)
+    local zm_page = { page };
+    imgui.PushItemWidth(CONTENT_W - 10);
+
+    local function zm_section(label)
+        imgui.TextColored({0.45,0.65,0.85,1.0}, label);
+        imgui.Separator();
+    end
+
+    -- PAGE 0: STATUS
+    if zm_page[1] == 0 then
+        zm_section('Volume');
+        imgui.SetNextItemWidth(CONTENT_W - 50);
+        if imgui.SliderInt('##zmvol', gui_state.volume, 0, 100) then
+            music_config.volume = gui_state.volume[1] * 10;
+            if zone_is_playing or zone_is_paused then
+                if zone_fading then zone_target_vol = music_config.volume;
+                else zone_current_vol = music_config.volume; set_volume(zone_alias, music_config.volume); end
+            end
+            if battle_is_playing and not battle_is_silent then
+                if battle_fading then battle_target_vol = music_config.volume;
+                else battle_current_vol = music_config.volume; set_volume(battle_alias, music_config.volume); end
+            end
+        end
+        imgui.SameLine();
+        imgui.TextColored({0.5,1.0,0.5,1.0}, string.format('%d%%', gui_state.volume[1]));
+
+        imgui.Spacing();
+        zm_section('Current State');
+        imgui.TextColored({0.7,0.7,0.7,1.0}, current_state);
+
+        local party = AshitaCore:GetMemoryManager():GetParty();
+        local zone_id = party:GetMemberZone(0);
+        local hp_per = party:GetMemberHPPercent(0);
+        local vana_hour = get_vana_hour();
+        local is_night = (vana_hour >= 18) or (vana_hour < 6);
+
+        imgui.Text(string.format('Zone %d  |  HP %d%%  |  Vana %02d:00 (%s)',
+            zone_id, hp_per, vana_hour, is_night and 'Night' or 'Day'));
+
+        if in_crisis_mode then
+            imgui.TextColored({1.0,0.4,0.4,1.0}, string.format('Crisis  |  Threshold %d%%', music_config.low_hp_threshold));
+        else
+            imgui.TextColored({0.5,0.5,0.5,1.0}, string.format('No crisis  |  Threshold %d%%', music_config.low_hp_threshold));
+        end
+
+        -- Per-zone opt-out for wherever the player is standing right now.
+        -- It only means something while the addon itself is on.
+        if (music_config.enabled) then
+            local zone_on = { not is_zone_disabled(zone_id) };
+            if imgui.Checkbox('Addon music in this zone', zone_on) then
+                set_zone_disabled(zone_id, not zone_on[1]);
+            end
+        else
+            imgui.TextColored({0.88,0.57,0.48,1.0}, 'ZoneMusic is off everywhere (switch at the top of the window).');
+        end
+
+        imgui.Spacing();
+        zm_section('Now Playing');
+        imgui.Spacing();
+        local zone_display = (current_zone_track_display ~= "")
+            and current_zone_track_display or current_zone_track;
+        local zone_status = zone_is_playing and (zone_display .. ' ♪')
+                         or (zone_is_paused and (zone_display .. ' ‖'))
+                         or (idle_replay.pending and (zone_display .. ' · waiting'))
+                         or '—';
+        imgui.Text('Zone:   ' .. zone_status);
+        if idle_replay.pending then
+            imgui.TextColored({0.5,0.7,1.0,1.0},
+                string.format('Replay in %.0fs', math.max(0, idle_replay.due - os.clock())));
+        end
+
+        if battle_is_playing then
+            local battle_display = (current_battle_track_display ~= "")
+                and current_battle_track_display or current_battle_track;
+            if battle_is_silent then
+                local rw = music_config.battle_resume_window or 60;
+                local rem = math.max(0, rw - (os.clock() - battle_silent_time));
+                imgui.TextColored({1.0,0.8,0.2,1.0},
+                    string.format('Battle: %s (silent %.0fs)', battle_display, rem));
+            else
+                imgui.Text('Battle: ' .. battle_display);
+            end
+        end
+
+        if duck_current_vol < 0.99 then
+            imgui.TextColored({1.0,0.8,0.2,1.0},
+                string.format('Ducked → %d%%', math.floor(duck_current_vol * 100)));
+        end
+
+    -- PAGE 1: BATTLE
+    elseif zm_page[1] == 1 then
+        zm_section('Battle Music');
+        imgui.Checkbox('Enable Battle Music', gui_state.use_battle);
+
+        imgui.Spacing();
+        zm_section('Style');
+        if imgui.RadioButton('Solo and Party', gui_state.battle_mode[1] == 0) then
+            gui_state.battle_mode[1] = 0; music_config.battle_mode = 0;
+        end
+        imgui.SameLine();
+        if imgui.RadioButton('Solo', gui_state.battle_mode[1] == 1) then
+            gui_state.battle_mode[1] = 1; music_config.battle_mode = 1;
+        end
+        imgui.SameLine();
+        if imgui.RadioButton('Party', gui_state.battle_mode[1] == 2) then
+            gui_state.battle_mode[1] = 2; music_config.battle_mode = 2;
+        end
+
+        if imgui.Checkbox('Random Any Zone Battle Music', gui_state.random_battle) then
+            music_config.random_battle = gui_state.random_battle[1];
+            if gui_state.random_battle[1] then
+                scan_battle_tracks();
+                current_random_track = '';
+            end
+        end
+
+        imgui.Spacing();
+        zm_section('Dynamic Mode');
+
+        local dyn_on = gui_state.battle_dynamic[1];
+        local dyn_col = dyn_on and {0.1,0.5,0.1,1.0} or {0.35,0.35,0.35,1.0};
+        local dyn_hov = dyn_on and {0.2,0.7,0.2,1.0} or {0.5,0.5,0.5,1.0};
+        imgui.PushStyleColor(ImGuiCol_Button, dyn_col);
+        imgui.PushStyleColor(ImGuiCol_ButtonHovered, dyn_hov);
+        if imgui.Button(dyn_on and 'Dynamic ON' or 'Dynamic OFF', {CONTENT_W - 10, 22}) then
+            gui_state.battle_dynamic[1] = not dyn_on;
+            music_config.battle_dynamic = gui_state.battle_dynamic[1];
+            if dyn_on and battle_is_silent then
+                stop_battle_music_instant();
+                current_battle_track = ''; current_random_track = '';
+                zone_coinflip_active = false; zone_coinflip_suffix = '';
+            end
+        end
+        imgui.PopStyleColor(2);
+
+        if gui_state.battle_dynamic[1] then
+            imgui.Text('Resume Window');
+            imgui.SetNextItemWidth(CONTENT_W - 50);
+            if imgui.SliderInt('##resumewin', gui_state.battle_resume_window, 10, 120) then
+                music_config.battle_resume_window = gui_state.battle_resume_window[1];
+            end
+            imgui.SameLine();
+            imgui.TextColored({0.5,0.5,0.5,1.0}, string.format('%ds', gui_state.battle_resume_window[1]));
+            if battle_is_silent then
+                local rw = music_config.battle_resume_window or 60;
+                local rem = math.max(0, rw - (os.clock() - battle_silent_time));
+                imgui.TextColored({1.0,0.8,0.2,1.0}, string.format('Re-engage: %.0fs left', rem));
+            end
+        end
+
+        imgui.Spacing();
+        imgui.Text('Battle Delay');
+        imgui.SetNextItemWidth(CONTENT_W - 50);
+        if imgui.SliderInt('##batdelay', gui_state.delay, 0, 100) then
+            music_config.battle_delay = gui_state.delay[1] / 10;
+        end
+        imgui.SameLine();
+        imgui.TextColored({0.5,0.5,0.5,1.0}, string.format('%.1fs', gui_state.delay[1] / 10));
+        imgui.TextColored({0.5,0.5,0.5,1.0}, 'Delays battle/idle switching; it does not delay theme replays.');
+
+    -- PAGE 2: PLAYBACK
+    elseif zm_page[1] == 2 then
+        zm_section('Zone Music');
+        if imgui.Checkbox('Play zone themes', gui_state.use_zone) then
+            music_config.enable_zone = gui_state.use_zone[1];
+            clear_idle_replay();
+            update_music();
+        end
+        imgui.TextColored({0.5,0.5,0.5,1.0}, 'Off silences the zone theme while the addon stays on.');
+        imgui.Spacing();
+        zm_section('Idle Theme Replay');
+        if imgui.Checkbox('Enable idle replay', gui_state.use_idle_replay) then
+            music_config.enable_idle_replay = gui_state.use_idle_replay[1];
+            clear_idle_replay();
+            update_music();
+        end
+        if gui_state.use_idle_replay[1] then
+            imgui.TextColored({0.65,0.65,0.65,1.0}, 'After a zone theme finishes, wait before playing it again.');
+            imgui.Spacing();
+            imgui.Text('Replay after:');
+            imgui.SameLine();
+            imgui.SetNextItemWidth(CONTENT_W - 160);
+            if imgui.SliderFloat('##idlereplaydelay', gui_state.idle_replay_delay_min, 0, 10, '%.1f') then
+                music_config.idle_replay_delay = math.floor(gui_state.idle_replay_delay_min[1] * 60 + 0.5); -- minutes -> seconds
+            end
+            imgui.SameLine();
+            imgui.TextColored({0.5,1.0,0.5,1.0}, 'minutes');
+            if gui_state.idle_replay_delay_min[1] <= 0 then
+                imgui.TextColored({0.5,0.5,0.5,1.0}, '0 keeps continuous looping.');
+            else
+                imgui.TextColored({0.5,0.5,0.5,1.0}, 'Idle themes play once, then wait before replaying.');
+            end
+        else
+            imgui.TextColored({0.5,0.5,0.5,1.0}, 'Idle replay disabled — the zone theme loops continuously.');
+        end
+
+    -- PAGE 3: FADE & DUCK
+    elseif zm_page[1] == 3 then
+        zm_section('Fade');
+        if imgui.Checkbox('Enable Fade In/Out', gui_state.use_fade) then
+            music_config.enable_fade = gui_state.use_fade[1];
+        end
+        if gui_state.use_fade[1] then
+            imgui.Text('Fade Duration');
+            imgui.SetNextItemWidth(CONTENT_W - 50);
+            if imgui.SliderInt('##fadedur', gui_state.fade_dur, 1, 50) then
+                music_config.fade_duration = gui_state.fade_dur[1] / 10;
+            end
+            imgui.SameLine();
+            imgui.TextColored({0.5,0.5,0.5,1.0}, string.format('%.1fs', gui_state.fade_dur[1] / 10));
+
+            local fade_info = '';
+            if zone_fading then
+                fade_info = string.format('Zone %d%%→%d%%',
+                    math.floor(zone_current_vol/10), math.floor(zone_target_vol/10));
+            end
+            if battle_fading then
+                if fade_info ~= '' then fade_info = fade_info .. '  '; end
+                fade_info = fade_info .. string.format('Battle %d%%→%d%%',
+                    math.floor(battle_current_vol/10), math.floor(battle_target_vol/10));
+            end
+            if fade_info ~= '' then
+                imgui.TextColored({0.5,0.8,1.0,1.0}, fade_info);
+            end
+        end
+
+        imgui.Spacing();
+        zm_section('Voice Ducking');
+        if imgui.Checkbox('Duck when voices play', gui_state.use_duck) then
+            music_config.enable_duck = gui_state.use_duck[1];
+        end
+        if gui_state.use_duck[1] then
+            imgui.Text('Duck Level');
+            imgui.SetNextItemWidth(CONTENT_W - 50);
+            if imgui.SliderInt('##duckpct', gui_state.duck_pct, 0, 80) then
+                music_config.duck_percent = gui_state.duck_pct[1];
+            end
+            imgui.SameLine();
+            imgui.TextColored({0.5,0.5,0.5,1.0}, string.format('%d%%', gui_state.duck_pct[1]));
+            if duck_current_vol < 0.99 then
+                imgui.TextColored({1.0,0.8,0.2,1.0},
+                    string.format('Ducked → %d%%', math.floor(duck_current_vol * 100)));
+            end
+        end
+
+    -- PAGE 4: EVENTS
+    elseif zm_page[1] == 4 then
+        zm_section('Special Events');
+        imgui.Checkbox('Play NM Music', gui_state.use_nm);
+
+        imgui.Spacing();
+        imgui.Checkbox('Play Low HP Music', gui_state.use_lowhp);
+        if gui_state.use_lowhp[1] then
+            imgui.Text('HP Threshold');
+            imgui.SetNextItemWidth(CONTENT_W - 50);
+            imgui.SliderInt('##hpthresh', gui_state.low_hp, 1, 50);
+            imgui.SameLine();
+            imgui.TextColored({0.5,0.5,0.5,1.0}, string.format('%d%%', gui_state.low_hp[1]));
+        end
+
+        imgui.Spacing();
+        if imgui.Checkbox('Play Fishing Music', gui_state.use_fishing) then
+            music_config.enable_fishing = gui_state.use_fishing[1];
+        end
+        if gui_state.use_fishing[1] then
+            imgui.TextColored({0.5,0.5,0.5,1.0}, 'Small "!" bite: fishing_small.wav');
+            imgui.TextColored({0.5,0.5,0.5,1.0}, 'Large "!!!" bite: fishing_large.wav');
+            imgui.TextColored({0.5,0.5,0.5,1.0}, 'Fallback: fishing.wav (either type)');
+            if fishing_active then
+                imgui.TextColored({1.0,0.8,0.2,1.0},
+                    string.format('Active: %s bite', fishing_bite_type or "?"));
+            end
+        end
+
+        imgui.Spacing();
+        if imgui.Checkbox('Play Mog House Music', gui_state.use_moghouse) then
+            music_config.enable_moghouse = gui_state.use_moghouse[1];
+            jukebox.mh_sync();
+        end
+        if gui_state.use_moghouse[1] then
+            imgui.TextColored({0.5,0.5,0.5,1.0}, 'moghouse.wav');
+            imgui.TextColored({0.5,0.5,0.5,1.0}, 'Plays only inside a Mog House (zone-in flag); native theme silenced');
+            if moghouse_active then
+                imgui.TextColored({1.0,0.8,0.2,1.0}, 'Active: in Mog House');
+            end
+        end
+
+        imgui.Spacing();
+        if imgui.Checkbox('Play Chocobo Music', gui_state.use_chocobo) then
+            music_config.enable_chocobo = gui_state.use_chocobo[1];
+        end
+        if gui_state.use_chocobo[1] then
+            imgui.TextColored({0.5,0.5,0.5,1.0}, 'chocobo.wav');
+            imgui.TextColored({0.5,0.5,0.5,1.0}, 'Plays while mounted (Status 5)');
+        end
+    end
+    imgui.PopItemWidth();
+end
+
+------------------------------------------------------------
+-- 6.5 JUKEBOX
+-- Browse every track in the sounds folder and preview it on demand. The
+-- preview runs on its own MCI alias; live music is held (zone paused,
+-- battle stopped) and picks back up when the preview ends, is stopped, or
+-- the window closes.
+------------------------------------------------------------
+
+-- Friendly names for tracks the file name alone can't explain.
+jukebox.labels = {
+    nm_battle            = 'Notorious Monsters (shared theme)',
+    eald_narche_battle   = 'Eald\'narche',
+    eald_narche_belief   = 'Eald\'narche - Belief',
+    belief_short         = 'Belief (short)',
+    lowhp                = 'Low HP',
+    fishing              = 'Fishing',
+    fishing_small        = 'Fishing - small bite',
+    fishing_large        = 'Fishing - large bite',
+    moghouse             = 'Mog House',
+    chocobo              = 'Chocobo',
+    death                = 'Death',
+    day_default          = 'Default day theme',
+    night_default        = 'Default night theme',
+    idle_default         = 'Default idle theme',
+    battle_default       = 'Default battle theme',
+};
+
+-- Cutscene / menu tracks (musicNNN files). Titles are cleaned up from the
+-- BGW name list, "where" says where the game plays them, and group sets the
+-- section on the Cutscenes tab. Group follows the DAT folder the cover ships
+-- in (sound = base, sound2 = Zilart, sound3 = Promathia), except title and
+-- menu themes, which get their own section. hide = the same music already
+-- exists as a zone track, so it is not listed twice.
+jukebox.scene_groups = {
+    menu  = { order = 1, title = 'Title & Menu' },
+    base  = { order = 2, title = 'Base Game' },
+    rotz  = { order = 3, title = 'Rise of the Zilart' },
+    cop   = { order = 4, title = 'Chains of Promathia' },
+    other = { order = 5, title = 'Other' },
+};
+jukebox.scene_info = {
+    [34]  = { group = 'menu', title = 'We Are Vana\'diel',             where = 'Title screen' },
+    [58]  = { group = 'menu', title = 'A New Direction',               where = 'Title screen' },
+    [108] = { group = 'menu', title = 'Vana\'diel March',              where = 'Title screen' },
+    [140] = { group = 'menu', title = 'Wings of the Goddess',          where = 'Title screen' },
+    [179] = { group = 'menu', title = 'Vana\'diel March #4',           where = 'Title screen' },
+    [242] = { group = 'menu', title = 'Unity',                         where = 'Title screen' },
+    [153] = { group = 'menu', title = 'Prelude',                       where = 'Login and updating' },
+
+    [111] = { group = 'base', title = 'Blackout',                      where = 'Knocked out' },
+    [122] = { group = 'base', title = 'One Last Time',                 where = 'Mission and quest scenes' },
+    [123] = { group = 'base', title = 'Hopelessness',                  where = 'Mission and quest scenes' },
+    [124] = { group = 'base', title = 'Recollection',                  where = 'Mission and quest scenes' },
+    [127] = { group = 'base', title = 'Anxiety',                       where = 'Mission and quest scenes' },
+    [159] = { group = 'base', title = 'Sorrow',                        where = 'Mission and quest scenes' },
+    [160] = { group = 'base', title = 'Repression',                    where = 'Memoro de la S^tono' },
+    [161] = { group = 'base', title = 'Despair',                       where = 'Memoro de la S^tono' },
+    [163] = { group = 'base', title = 'Sometime, Somewhere',           where = 'Mission and quest scenes' },
+    [169] = { group = 'base', title = 'Regeneracy',                    where = 'Job Change Land' },
+    [170] = { group = 'base', title = 'Buccaneers',                    where = 'Pirate attack on the ferry' },
+
+    [181] = { group = 'rotz', title = 'Unnamed cutscene track',          where = 'Zilart cutscenes' },
+    [194] = { group = 'rotz', title = 'Bloody Promises',               where = 'Raogrimm\'s theme' },
+    [197] = { group = 'rotz', title = 'To the Heavens',                where = 'Kamlanaut, Zilart missions (unreleased track)' },
+    [199] = { group = 'rotz', title = 'Grav\'iton',                    where = 'Zilart missions' },
+    [200] = { group = 'rotz', title = 'Hidden Truths',                 where = 'Kamlanaut' },
+    [201] = { group = 'rotz', title = 'End Theme',                     where = 'Zilart ending' },
+    [202] = { group = 'rotz', title = 'Moongate',                      where = 'Memoro de la S^tono' },
+    [203] = { group = 'rotz', title = 'Unnamed cutscene track',          where = 'Zilart cutscenes' },
+    [204] = { group = 'rotz', title = 'Unnamed cutscene track',          where = 'Zilart cutscenes' },
+    [205] = { group = 'rotz', title = 'Unnamed cutscene track',          where = 'Zilart cutscenes' },
+    [206] = { group = 'rotz', title = 'Revenant Maiden',               where = 'Yve\'noile' },
+    [212] = { group = 'rotz', title = 'Dash de Chocobo',               where = 'Chocobo riding' },
+    [214] = { group = 'rotz', title = 'Eternal Oath',                  where = 'Wedding ceremony' },
+    [256] = { group = 'rotz', title = 'Unnamed cutscene track',          where = 'Zilart cutscenes' },
+
+    [137] = { group = 'cop',  title = 'A Realm of Emptiness',          where = 'Promathia final boss phase 2, Apocalypse Nigh (unreleased track)' },
+    [223] = { group = 'cop',  title = 'Conflict: March of the Hero',   where = 'Conflict, your side winning' },
+    [224] = { group = 'cop',  title = 'Dusk and Dawn',                 where = 'Promathia missions' },
+    [231] = { group = 'cop',  title = 'Celestial Thunder',             where = 'Nag\'molada\'s theme' },
+    [232] = { group = 'cop',  title = 'Ruler of the Skies',            where = 'Promathia missions' },
+    [238] = { group = 'cop',  title = 'A New Morning',                 where = 'Promathia missions' },
+    [229] = { hide = true },  -- Phanauet Channel / Manaclipper zone theme (day_1)
+    [233] = { hide = true },  -- Al'Taieu zone theme (day_33, identical file)
+    [245] = { hide = true },  -- Tavnazian Safehold zone theme (day_26)
+};
+
+function jukebox.zone_name(zid)
+    local ok, name = pcall(function()
+        return AshitaCore:GetResourceManager():GetString('zones.names', zid);
+    end);
+    if (ok and name ~= nil and name ~= '') then return name; end
+    return 'Zone ' .. tostring(zid);
+end
+
+-- The jukebox list is grouped by expansion first, then by kind of area.
+-- zone_expansion (above) only tags the new-world expansions the coverage
+-- gate needs; the old world is split here into the three original releases.
+jukebox.expansions = {
+    base         = { order = 1, title = 'Base Game' },
+    rotz         = { order = 2, title = 'Rise of the Zilart' },
+    cop          = { order = 3, title = 'Chains of Promathia' },
+    toau         = { order = 4, title = 'Treasures of Aht Urhgan' },
+    wotg         = { order = 5, title = 'Wings of the Goddess' },
+    abyssea      = { order = 6, title = 'Abyssea' },
+    soa          = { order = 7, title = 'Seekers of Adoulin' },
+    walkofechoes = { order = 8, title = 'Walk of Echoes' },
+};
+
+-- Old-world zones that shipped with Rise of the Zilart.
+jukebox.rotz_zones = {
+    [113] = true, [114] = true, [121] = true, [122] = true, [123] = true, [124] = true,  -- Teriggan, E. Altepa, Zi'Tah, Ro'Maeve, Yuhtunga, Yhoator
+    [125] = true, [128] = true, [130] = true,                                            -- W. Altepa, Valley of Sorrows, Ru'Aun Gardens
+    [153] = true, [154] = true, [159] = true, [160] = true, [163] = true, [168] = true,  -- Boyahda Tree, Dragon's Aery, Uggalepih, Den of Rancor, Sacrificial Chamber, Chamber of Oracles
+    [174] = true, [176] = true, [177] = true, [178] = true, [179] = true, [180] = true,  -- Kuftal, Sea Serpent Grotto, Ve'Lugannon, Ru'Avitau, Stellar Fulcrum, La'Loff
+    [181] = true, [201] = true, [202] = true, [203] = true, [205] = true, [207] = true,  -- Celestial Nexus, Cloisters, Ifrit's Cauldron
+    [208] = true, [209] = true, [211] = true, [212] = true, [213] = true,                -- Quicksand Caves, Cloisters, Gustav Tunnel, Onzozo
+    [226] = true, [247] = true, [250] = true, [251] = true, [252] = true,               -- Kazham airship, Rabao, Kazham, Hall of the Gods, Norg
+};
+
+-- Server zone types (1 city, 2 outdoors, 3 dungeon, 4 battlefield,
+-- 5 Dynamis, 6 instanced), taken from the zone settings table.
+jukebox.zone_types = {
+    [0]=1, [1]=2, [2]=2, [3]=2, [4]=2, [5]=2, [6]=4, [7]=2, [8]=4, [9]=3, [10]=4, [11]=3,
+    [12]=3, [13]=4, [14]=3, [15]=2, [16]=3, [17]=4, [18]=3, [19]=4, [20]=3, [21]=4, [22]=3, [23]=4,
+    [24]=2, [25]=2, [26]=1, [27]=3, [28]=3, [29]=3, [30]=3, [31]=4, [32]=1, [33]=2, [34]=3, [35]=3,
+    [36]=4, [37]=4, [38]=4, [39]=5, [40]=5, [41]=5, [42]=5, [43]=2, [44]=2, [45]=2, [46]=2, [47]=2,
+    [48]=1, [50]=1, [51]=2, [52]=2, [53]=2, [54]=2, [55]=6, [56]=6, [57]=4, [58]=2, [59]=2, [60]=6,
+    [61]=2, [62]=3, [63]=6, [64]=4, [65]=3, [66]=6, [67]=4, [68]=3, [69]=6, [70]=1, [71]=1, [72]=3,
+    [73]=6, [74]=6, [75]=6, [76]=6, [77]=6, [78]=4, [79]=2, [80]=1, [81]=2, [82]=2, [83]=2, [84]=2,
+    [85]=2, [86]=6, [87]=1, [88]=2, [89]=2, [90]=2, [91]=2, [92]=3, [93]=6, [94]=1, [95]=2, [96]=3,
+    [97]=2, [98]=2, [99]=3, [100]=2, [101]=2, [102]=2, [103]=2, [104]=2, [105]=2, [106]=2, [107]=2, [108]=2,
+    [109]=2, [110]=2, [111]=2, [112]=2, [113]=2, [114]=2, [115]=2, [116]=2, [117]=2, [118]=2, [119]=2, [120]=2,
+    [121]=2, [122]=2, [123]=2, [124]=2, [125]=2, [126]=2, [127]=2, [128]=2, [129]=6, [130]=2, [131]=3, [132]=2,
+    [134]=5, [135]=5, [136]=2, [137]=2, [138]=3, [139]=4, [140]=3, [141]=3, [142]=3, [143]=3, [144]=4, [145]=3,
+    [146]=4, [147]=3, [148]=3, [149]=3, [150]=3, [151]=3, [152]=3, [153]=3, [154]=3, [155]=3, [156]=4, [157]=3,
+    [158]=3, [159]=3, [160]=3, [161]=3, [162]=3, [163]=4, [164]=3, [165]=4, [166]=3, [167]=3, [168]=4, [169]=3,
+    [170]=4, [171]=3, [172]=3, [173]=3, [174]=3, [175]=3, [176]=3, [177]=3, [178]=3, [179]=4, [180]=4, [181]=4,
+    [182]=4, [183]=6, [184]=3, [185]=5, [186]=5, [187]=5, [188]=5, [189]=1, [190]=3, [191]=3, [192]=3, [193]=3,
+    [194]=3, [195]=3, [196]=3, [197]=3, [198]=3, [199]=1, [200]=3, [201]=4, [202]=4, [203]=4, [204]=3, [205]=3,
+    [206]=4, [207]=4, [208]=3, [209]=4, [211]=4, [212]=3, [213]=3, [214]=1, [215]=2, [216]=2, [217]=2, [218]=2,
+    [219]=1, [222]=4, [223]=2, [224]=2, [225]=2, [226]=2, [227]=2, [228]=2, [229]=4, [230]=1, [231]=1, [232]=1,
+    [233]=1, [234]=1, [235]=1, [236]=1, [237]=1, [238]=1, [239]=1, [240]=1, [241]=1, [242]=1, [243]=1, [244]=1,
+    [245]=1, [246]=1, [247]=1, [248]=1, [249]=1, [250]=1, [251]=1, [252]=1, [253]=2, [254]=2, [255]=2, [256]=1,
+    [257]=1, [258]=3, [259]=6, [260]=2, [261]=2, [262]=2, [263]=2, [264]=6, [265]=2, [266]=2, [267]=2, [268]=3,
+    [269]=3, [270]=3, [271]=6, [272]=3, [273]=3, [274]=3, [280]=1, [284]=1, [285]=1, [287]=6, [288]=2, [289]=2,
+    [294]=5, [295]=5, [296]=5, [297]=5,
+};
+
+-- Zones that exist but hold nothing worth browsing (staff-only areas).
+jukebox.hidden_zones = { [0] = true, [210] = true };
+
+jukebox.areas = {
+    cities   = { order = 1, title = 'Cities' },
+    towns    = { order = 2, title = 'Towns' },
+    field    = { order = 3, title = 'Field' },
+    dungeons = { order = 4, title = 'Dungeons' },
+    battle   = { order = 5, title = 'Battlefields' },
+    ships    = { order = 6, title = 'Ships & Airships' },
+};
+
+-- Returns expansion key and area key for a zone.
+function jukebox.zone_category(zid)
+    local exp = zone_expansion[zid];
+    if (exp == nil) then
+        if (jukebox.rotz_zones[zid]) then
+            exp = 'rotz';
+        elseif (zid >= 1 and zid <= 44) then
+            exp = 'cop';
+        else
+            exp = 'base';
+        end
+    end
+
+    local area;
+    local ztype = jukebox.zone_types[zid] or 3;
+    if ((zid >= 220 and zid <= 228) or zid == 1 or zid == 3 or zid == 46 or zid == 58 or zid == 59) then
+        area = 'ships';     -- ships, airships, the barge and the Manaclipper
+    elseif (zid == 32 or ztype == 4 or ztype == 5) then
+        area = 'battle';    -- Sealion's Den is typed as a city server-side
+    elseif (zid == 251) then
+        area = 'dungeons';  -- Hall of the Gods is typed as a city server-side
+    elseif (ztype == 1) then
+        area = (zid >= 230 and zid <= 246) and 'cities' or 'towns';
+    elseif (ztype == 2) then
+        area = 'field';
+    else
+        area = 'dungeons';
+    end
+    return exp, area;
+end
+
+-- Event tracks the addon does not play in-game, so their cards say so.
+jukebox.event_notes = {
+    death = 'Preview only: on death the addon steps aside for the game\'s own death music',
+};
+
+-- Zones the game scores itself from the cover DATs, with correct phase
+-- timing the addon cannot reproduce. Like Eald'narche, the addon never
+-- takes these over: adding day_/battle_ files for them would silence the
+-- game's battle slot and cut the phase-2 theme after the cutscene.
+jukebox.game_zones = {
+    [36] = {  -- Empyreal Paradox: Promathia (Dawn) and Apocalypse Nigh
+        note = 'The game plays this zone\'s music from the cover DATs so the Promathia fight keeps its timing: Dusk and Dawn in phase 1, then A Realm of Emptiness from the cutscene on. The addon stays out of this zone on purpose. Do not add day_36 or battle_36 files: they would silence the fight.',
+        tracks = {
+            { label = 'Battle (phase 1)',    file = 'music224.mp3' },
+            { label = 'Promathia (phase 2)', file = 'music137.mp3' },
+        },
+    },
+};
+
+jukebox.city_titles = {
+    sandoria = 'San d\'Oria', bastok = 'Bastok', windurst = 'Windurst', jeuno = 'Jeuno',
+    ronfaure = 'Ronfaure', gustaberg = 'Gustaberg', sarutabaruta = 'Sarutabaruta',
+};
+
+function jukebox.pretty(base)
+    local s = base:gsub('_', ' ');
+    return (s:gsub('(%a)([%w\']*)', function(a, b) return a:upper() .. b; end));
+end
+
+function jukebox.build_catalog()
+    local sounds_path = jukebox.sounds_dir();
+    -- base name (lowercase, no extension) -> on-disk filename; MP3 wins
+    -- over a WAV master of the same name.
+    local files = {};
+    for _, ext in ipairs({ 'wav', 'mp3' }) do
+        for _, entry in ipairs(jukebox.list_dir(sounds_path, '*.' .. ext)) do
+            local base = entry.name:match('^(.*)%.[^.]+$');
+            if (base ~= nil) then files[string.lower(base)] = entry.name; end
+        end
+    end
+
+    -- Boss theme file -> mob names, straight from the NM override map.
+    local boss_names = {};
+    for mob, track in pairs(unique_nm_list) do
+        if (type(track) == 'string') then
+            local base = string.lower(track:match('^(.*)%.[^.]+$') or track);
+            boss_names[base] = boss_names[base] and (boss_names[base] .. ' / ' .. mob) or mob;
+        end
+    end
+
+    local zones_by_id = {};
+    local catalog = { zones = {}, bosses = {}, events = {}, scenes = {}, other = {}, by_file = {} };
+
+    local function add_track(list, base, file, label, sub)
+        local item = { file = file, label = label, sub = sub };
+        table.insert(list, item);
+        catalog.by_file[string.lower(file)] = item;
+        catalog.by_file[base .. '.wav'] = item; -- DJ tables still use WAV names
+        return item;
+    end
+
+    for base, file in pairs(files) do
+        local kind, zid = nil, nil;
+        local d = base:match('^day_(%d+)$');
+        local n = base:match('^night_(%d+)$');
+        local bs = base:match('^battle_(%d+)_solo$');
+        local bp = base:match('^battle_(%d+)_party$');
+        local mus = base:match('^music(%d+)$');
+        if (d) then kind, zid = 'day', tonumber(d);
+        elseif (n) then kind, zid = 'night', tonumber(n);
+        elseif (bs) then kind, zid = 'solo', tonumber(bs);
+        elseif (bp) then kind, zid = 'party', tonumber(bp);
+        end
+
+        if (kind ~= nil) then
+            local zone = zones_by_id[zid];
+            if (zone == nil) then
+                zone = { id = zid, tracks = {} };
+                zones_by_id[zid] = zone;
+            end
+            zone.tracks[kind] = file;
+        elseif (mus ~= nil) then
+            local id = tonumber(mus);
+            local info = jukebox.scene_info[id];
+            if (info == nil or not info.hide) then
+                local group = (info and info.group) or 'other';
+                local title = (info and info.title) or BGW_NAMES[id] or ('Unnamed track ' .. id);
+                local where = (info and info.where) and (info.where .. '  ·  ') or '';
+                local item = add_track(catalog.scenes, base, file, title, where .. 'music' .. id);
+                item.group = group;
+                item.group_title = jukebox.scene_groups[group].title;
+                item.sort = jukebox.scene_groups[group].order * 1000 + id;
+            end
+        elseif (boss_names[base] ~= nil or base:match('_battle$') or base:match('belief')) then
+            local label = jukebox.labels[base] or boss_names[base] or jukebox.pretty(base:gsub('_battle$', ''));
+            add_track(catalog.bosses, base, file, label, file);
+        elseif (jukebox.labels[base] ~= nil) then
+            add_track(catalog.events, base, file, jukebox.labels[base], jukebox.event_notes[base] or file);
+        else
+            add_track(catalog.other, base, file, jukebox.pretty(base), file);
+        end
+    end
+
+    -- City groups collapse onto their canonical id, mirroring how the DJ
+    -- resolves idle tracks (canonical file first, then any sibling).
+    local merged = {};
+    for zid, zone in pairs(zones_by_id) do
+        if (not jukebox.hidden_zones[zid]) then
+            local canon = get_canonical_zone(zid);
+            local entry = merged[canon];
+            if (entry == nil) then
+                entry = { id = canon, tracks = {} };
+                merged[canon] = entry;
+            end
+            for kind, file in pairs(zone.tracks) do
+                if (zid == canon or entry.tracks[kind] == nil) then
+                    entry.tracks[kind] = file;
+                end
+            end
+        end
+    end
+
+    local sort_key = {};
+    for canon, entry in pairs(merged) do
+        local group = city_groups[canon];
+        if (group ~= nil) then
+            entry.name = jukebox.city_titles[group] or jukebox.pretty(group);
+            local members = {};
+            for zid, g in pairs(city_groups) do
+                if (g == group) then table.insert(members, zid); end
+            end
+            table.sort(members);
+            local names = {};
+            for _, zid in ipairs(members) do table.insert(names, jukebox.zone_name(zid)); end
+            entry.districts = table.concat(names, ' · ');
+            entry.members = members;
+        else
+            entry.name = jukebox.zone_name(canon);
+            entry.members = { canon };
+        end
+        local exp, area = jukebox.zone_category(canon);
+        entry.expansion = exp;
+        entry.expansion_title = jukebox.expansions[exp].title;
+        entry.area = area;
+        entry.category = jukebox.areas[area].title;
+        entry.active_expansion = expansion_enabled[zone_expansion[canon] or 'base'] == true;
+        sort_key[entry] = jukebox.expansions[exp].order * 100 + jukebox.areas[area].order;
+        table.insert(catalog.zones, entry);
+        for _, kind in ipairs({ 'day', 'night' }) do
+            local f = entry.tracks[kind];
+            if (f ~= nil) then
+                local key = string.lower(f);
+                catalog.by_file[key] = { zone = entry, kind = kind };
+                catalog.by_file[(key:gsub('%.mp3$', '.wav'))] = catalog.by_file[key];
+            end
+        end
+    end
+
+    -- Zones whose music the game plays from the cover DATs (the addon stays
+    -- out of them on purpose), listed so they are not missing from the
+    -- jukebox. They get their own cards instead of day/night/battle.
+    for zid, info in pairs(jukebox.game_zones) do
+        if (merged[zid] == nil) then
+            local cards = {};
+            for _, track in ipairs(info.tracks) do
+                local base = string.lower(track.file:match('^(.*)%.[^.]+$') or track.file);
+                if (files[base] ~= nil) then
+                    table.insert(cards, { label = track.label, file = files[base] });
+                end
+            end
+            if (#cards > 0) then
+                local exp, area = jukebox.zone_category(zid);
+                local entry = {
+                    id = zid, tracks = {}, custom = cards, game_played = true, note = info.note,
+                    name = jukebox.zone_name(zid), members = { zid },
+                    expansion = exp, expansion_title = jukebox.expansions[exp].title,
+                    area = area, category = jukebox.areas[area].title, active_expansion = true,
+                };
+                sort_key[entry] = jukebox.expansions[exp].order * 100 + jukebox.areas[area].order;
+                table.insert(catalog.zones, entry);
+            end
+        end
+    end
+
+    table.sort(catalog.zones, function(a, b)
+        if (sort_key[a] ~= sort_key[b]) then return sort_key[a] < sort_key[b]; end
+        return a.name < b.name;
+    end);
+    table.sort(catalog.scenes, function(a, b) return (a.sort or 0) < (b.sort or 0); end);
+    for _, list in ipairs({ catalog.bosses, catalog.events, catalog.other }) do
+        table.sort(list, function(a, b) return a.label < b.label; end);
+    end
+
+    -- Optional review list (review.lua next to the addon): a curated queue of
+    -- tracks to listen through, e.g. the ones an audio scan flagged. The
+    -- Review tab only appears while the file exists; players never see it.
+    catalog.review, catalog.review_title, catalog.review_desc = {}, nil, nil;
+    pcall(function()
+        local path = jukebox.sounds_dir():gsub('sounds\\$', '') .. 'review.lua';
+        local chunk = loadfile(path);
+        if (chunk == nil) then return; end
+        local data = chunk();
+        if (type(data) ~= 'table' or type(data.items) ~= 'table') then return; end
+        catalog.review_title = tostring(data.title or 'Review');
+        catalog.review_desc = tostring(data.description or '');
+        for _, entry in ipairs(data.items) do
+            local base = type(entry.file) == 'string' and string.lower(entry.file:match('^(.*)%.[^.]+$') or entry.file) or nil;
+            if (base ~= nil and files[base] ~= nil) then
+                table.insert(catalog.review, {
+                    file = files[base],
+                    label = tostring(entry.label or files[base]),
+                    sub = tostring(entry.note or files[base]),
+                });
+            end
+        end
+    end);
+
+    jukebox.catalog = catalog;
+    return catalog;
+end
+
+-- Friendly name for whatever file is playing live, for the footer.
+function jukebox.describe(file)
+    if (file == nil or file == '') then return nil; end
+    local cat = jukebox.catalog;
+    if (cat == nil) then return file; end
+    local key = string.lower(file);
+    local item = cat.by_file[key] or cat.by_file[(key:gsub('%.mp3$', '.wav'))];
+    if (item == nil) then return file; end
+    if (item.zone ~= nil) then
+        return string.format('%s · %s', item.zone.name, item.kind == 'night' and 'Night' or 'Day');
+    end
+    return item.label;
+end
+
+function jukebox.mci(cmd, want_reply)
+    if (not want_reply) then
+        return winmm.mciSendStringA(cmd, nil, 0, nil);
+    end
+    local buf = ffi.new('char[64]');
+    if (winmm.mciSendStringA(cmd, buf, 64, nil) ~= 0) then return nil; end
+    return ffi.string(buf);
+end
+
+-- What happens when a preview reaches its end: stop and go back to live
+-- music, loop the same track, or move on through the queue.
+jukebox.MODES = { 'once', 'repeat', 'continue' };
+jukebox.mode = 'continue';
+jukebox.paused = false;
+jukebox.queue = nil;   -- list of { file, label } the transport steps through
+jukebox.index = 0;
+
+function jukebox.stop(resume_live)
+    if (jukebox.active or jukebox.file ~= '') then
+        jukebox.mci('stop ' .. jukebox.alias);
+        jukebox.mci('close ' .. jukebox.alias);
+    end
+    local owed = jukebox.paused_zone;
+    jukebox.active = false;
+    jukebox.paused = false;
+    jukebox.file = '';
+    jukebox.label = '';
+    jukebox.length_ms = 0;
+    jukebox.pos_time = nil;
+    jukebox.paused_zone = false;
+    jukebox.last_vol = -1;
+    -- The queue survives a stop so Play can pick the list back up.
+    -- Only resume what the preview itself paused, and never over event music.
+    if (resume_live and owed and zone_is_paused and not handoff.active) then
+        resume_zone_music();
+    end
+end
+
+-- Open and start one queue entry. Live music is held the first time a
+-- preview starts; switching between previews leaves it held.
+function jukebox.open_track(item)
+    local file = item.file;
+    local resolved = resolve_audio_filename(file);
+    if (resolved == nil) then
+        print(chat.header('ZoneMusic'):append(chat.error('Jukebox: file not found: ' .. tostring(file))));
+        jukebox.stop(true);
+        return false;
+    end
+
+    if (jukebox.active) then
+        jukebox.mci('stop ' .. jukebox.alias);
+        jukebox.mci('close ' .. jukebox.alias);
+    else
+        if (zone_is_playing and not zone_is_paused) then
+            pause_zone_music_fast();
+            jukebox.paused_zone = true;
+        end
+        if (battle_is_playing) then
+            stop_battle_music_instant();
+        end
+    end
+
+    local path = jukebox.sounds_dir() .. resolved;
+    local result = jukebox.mci(string.format('open "%s" type %s alias %s', path, get_mci_type(resolved), jukebox.alias));
+    if (result ~= 0) then
+        print(chat.header('ZoneMusic'):append(chat.error('Jukebox could not open ' .. resolved .. ': ' .. jukebox.mci_error(result))));
+        jukebox.stop(true);
+        return false;
+    end
+    jukebox.mci('set ' .. jukebox.alias .. ' time format milliseconds');
+    jukebox.last_vol = -1;
+    set_volume(jukebox.alias, music_config.volume * duck_current_vol);
+    if (jukebox.mci('play ' .. jukebox.alias) ~= 0) then
+        print(chat.header('ZoneMusic'):append(chat.error('Jukebox: could not play ' .. resolved)));
+        jukebox.stop(true);
+        return false;
+    end
+
+    jukebox.active = true;
+    jukebox.paused = false;
+    jukebox.pos_time = nil;
+    jukebox.file = file;
+    jukebox.label = item.label or file;
+    jukebox.length_ms = tonumber(jukebox.mci('status ' .. jukebox.alias .. ' length', true) or '') or 0;
+    jukebox.last_poll = os.clock();
+    return true;
+end
+
+-- Start playing a list at a given entry; next/previous step through it.
+function jukebox.play_queue(queue, index)
+    if (queue == nil or queue[index] == nil) then return; end
+    jukebox.queue = queue;
+    jukebox.index = index;
+    jukebox.open_track(queue[index]);
+end
+
+function jukebox.play(file, label)
+    jukebox.play_queue({ { file = file, label = label } }, 1);
+end
+
+function jukebox.toggle_pause()
+    if (not jukebox.active) then
+        -- Nothing loaded: pick the queue back up where it stopped.
+        local q = jukebox.queue;
+        if (q ~= nil and q[jukebox.index] ~= nil) then
+            jukebox.open_track(q[jukebox.index]);
+        end
+        return;
+    end
+    if (jukebox.paused) then
+        -- 'play' with no range continues from the current (or seeked) spot.
+        jukebox.mci('play ' .. jukebox.alias);
+        jukebox.paused = false;
+    else
+        jukebox.mci('pause ' .. jukebox.alias);
+        jukebox.paused = true;
+    end
+    jukebox.pos_time = nil;
+end
+
+function jukebox.seek(ms)
+    if (not jukebox.active) then return; end
+    local limit = math.max(0, (jukebox.length_ms or 0) - 250);
+    ms = math.floor(math.max(0, math.min(ms or 0, limit)));
+    jukebox.mci(string.format('seek %s to %d', jukebox.alias, ms));
+    -- MCI parks the device after a seek; keep playing unless paused.
+    if (not jukebox.paused) then
+        jukebox.mci('play ' .. jukebox.alias);
+    end
+    jukebox.pos_ms = ms;
+    jukebox.pos_time = os.clock();
+    jukebox.last_poll = os.clock();
+end
+
+-- Skip within the queue. Previous restarts the current track first if it
+-- has been playing for more than a few seconds, like any media player.
+function jukebox.step(delta)
+    local q = jukebox.queue;
+    if (q == nil or #q == 0) then return; end
+    if (delta < 0 and jukebox.active and jukebox.position_ms() > 3000) then
+        jukebox.seek(0);
+        return;
+    end
+    local i = jukebox.index + delta;
+    if (i < 1) then i = #q; end
+    if (i > #q) then i = 1; end
+    jukebox.index = i;
+    jukebox.open_track(q[i]);
+end
+
+function jukebox.cycle_mode()
+    for i, m in ipairs(jukebox.MODES) do
+        if (m == jukebox.mode) then
+            jukebox.mode = jukebox.MODES[(i % #jukebox.MODES) + 1];
+            return;
+        end
+    end
+    jukebox.mode = 'continue';
+end
+
+-- A preview reached its natural end.
+function jukebox.finished()
+    if (jukebox.mode == 'repeat') then
+        jukebox.seek(0);
+    elseif (jukebox.mode == 'continue' and jukebox.queue ~= nil and jukebox.index < #jukebox.queue) then
+        jukebox.step(1);
+    else
+        jukebox.return_live();
+    end
+end
+
+-- The one real off switch. Off stops the addon's player and hands every
+-- music slot back to the game, so the zone's own music plays, and later
+-- zone-ins are left untouched. On takes the slots back and lets the DJ pick
+-- the zone's track. The per-zone switch still applies on top of this.
+function jukebox.set_addon_enabled(on)
+    local here = 0;
+    pcall(function() here = AshitaCore:GetMemoryManager():GetParty():GetMemberZone(0) or 0; end);
+    if (jukebox.active) then jukebox.stop(false); end
+
+    local msg;
+    if (on) then
+        music_config.enabled = true;
+        gui_state.enabled[1] = true;
+        if (zone_is_covered_expansion(here) and has_zonemusic_assets(here)) then
+            jukebox.silence_engine();
+        end
+        clear_idle_replay();
+        pcall(update_music);
+        msg = 'ZoneMusic ON.';
+    else
+        -- Ownership has to be read before the flag flips; afterwards every
+        -- zone reports as uncovered.
+        local owned = zone_is_covered_expansion(here) and has_zonemusic_assets(here);
+        music_config.enabled = false;
+        gui_state.enabled[1] = false;
+        stop_all_music();
+        msg = 'ZoneMusic OFF. Game music plays everywhere.';
+        if (owned and not jukebox.release_engine(here)) then
+            msg = msg .. ' This zone\'s music returns on your next zone-in.';
+        end
+        if (jukebox.detect_dat_overlay()) then
+            msg = msg .. ' Covers installed as DATs (zonemusicDATS) still play until that overlay is removed in /pivot.';
+        end
+    end
+    pcall(settings.save);
+    print(chat.header('ZoneMusic'):append(chat.message(msg)));
+end
+
+-- True when XIPivot's overlay list includes the ZoneMusic cover DATs. Those
+-- covers replace the game's own music files, so they keep playing even with
+-- the addon off; the window warns about it. Read once, then cached.
+function jukebox.detect_dat_overlay()
+    if (jukebox.dat_overlay ~= nil) then return jukebox.dat_overlay; end
+    jukebox.dat_overlay = false;
+    local f = io.open(AshitaCore:GetInstallPath() .. 'config\\pivot\\pivot.ini', 'r');
+    if (f == nil) then return false; end
+    local in_overlays = false;
+    for line in f:lines() do
+        local section = line:match('^%s*%[([^%]]+)%]');
+        if (section ~= nil) then
+            in_overlays = (string.lower(section) == 'overlays');
+        elseif (in_overlays and not line:match('^%s*;')) then
+            local value = line:match('=%s*(.-)%s*$');
+            if (value ~= nil and string.lower(value):find('zonemusic', 1, true)) then
+                jukebox.dat_overlay = true;
+            end
+        end
+    end
+    f:close();
+    return jukebox.dat_overlay;
+end
+
+-- The health check lives in zm_doctor.lua, loaded on demand and protected
+-- like the window, so a missing copy only disables /zm doctor.
+function jukebox.run_doctor()
+    if (jukebox.doctor == nil) then
+        local ok, mod = pcall(require, 'zm_doctor');
+        jukebox.doctor = (ok and type(mod) == 'table') and mod or false;
+        jukebox.doctor_error = (not ok) and tostring(mod) or nil;
+    end
+    if (jukebox.doctor == false) then return nil; end
+
+    local helper, pivot = nil, nil;
+    pcall(function() helper = AshitaCore:GetPluginManager():IsLoaded('ZMHelper'); end);
+    pcall(function() pivot = AshitaCore:GetPolPluginManager():IsLoaded('pivot'); end);
+    local env = {
+        version = addon.version,
+        install_path = AshitaCore:GetInstallPath(),
+        sounds_path = jukebox.sounds_dir(),
+        list_dir = jukebox.list_dir,
+        mci = jukebox.mci,
+        mci_error = jukebox.mci_error,
+        ui_error = zm_ui.load_error,
+        helper_loaded = helper,
+        pivot_loaded = pivot,
+        settings_repairs = jukebox.settings_repairs,
+        errors = jukebox.errors,
+        enabled = music_config.enabled,
+        disabled_zones = music_config.disabled_zones,
+        zone_name = jukebox.zone_name,
+    };
+    local report = jukebox.doctor.run(env);
+    jukebox.last_report = report;
+    pcall(function()
+        local f = io.open(env.install_path .. 'logs\\zonemusic_report.txt', 'w');
+        if (f ~= nil) then
+            f:write(jukebox.doctor.format(report, env));
+            f:close();
+        end
+    end);
+    return report;
+end
+
+-- /zm doctor: run the check and print the problems in chat.
+function jukebox.print_doctor()
+    local report = jukebox.run_doctor();
+    local header = chat.header('ZoneMusic');
+    if (report == nil) then
+        print(header:append(chat.error('The health check file (zm_doctor.lua) is missing: ' .. tostring(jukebox.doctor_error))));
+        return;
+    end
+    if (report.failures + report.warnings == 0) then
+        print(header:append(chat.success('Health check: everything looks good.')));
+    else
+        print(header:append(chat.message(string.format('Health check: %d problem(s), %d warning(s).',
+            report.failures, report.warnings))));
+        for _, item in ipairs(report.items) do
+            if (item.level == 'fail' or item.level == 'warn') then
+                local line = (item.level == 'fail' and 'PROBLEM: ' or 'Warning: ') .. item.title;
+                print(header:append(item.level == 'fail' and chat.error(line) or chat.warning(line)));
+                if (item.fix ~= nil) then print(chat.message('   Fix: ' .. item.fix)); end
+            end
+        end
+    end
+    print(chat.message('   Full report: logs\\zonemusic_report.txt (open the ZoneMusic window > Settings > Health for details).'));
+end
+
+-- Quiet check shortly after load: says nothing unless something is wrong.
+function jukebox.startup_check()
+    if (jukebox.startup_checked) then return; end
+    if (os.clock() < jukebox.quiet_until) then return; end
+    jukebox.startup_checked = true;
+    local report = jukebox.run_doctor();
+    if (report ~= nil and report.failures + report.warnings > 0) then
+        print(chat.header('ZoneMusic'):append(chat.warning(string.format(
+            'Found %d thing(s) that may affect your music. Type /zm doctor to see what and how to fix it.',
+            report.failures + report.warnings))));
+    end
+end
+
+-- End the preview and put the live zone music back right now. A plain stop
+-- only resumes a track the preview paused; if the zone was sitting in its
+-- idle-replay wait (or had nothing loaded), live music would stay silent
+-- until the replay timer fired. Clearing the wait and running the DJ once
+-- makes the zone theme come straight back.
+function jukebox.return_live()
+    jukebox.stop(true);
+    if (music_config.enabled and not handoff.active) then
+        clear_idle_replay();
+        pcall(update_music);
+    end
+end
+
+-- Cached for 0.1s: the window asks every frame, and MCI status calls at
+-- frame rate are the same thrash set_volume's dedupe exists to avoid.
+function jukebox.position_ms()
+    if (not jukebox.active) then return 0; end
+    local now = os.clock();
+    if (jukebox.pos_time ~= nil and (now - jukebox.pos_time) < 0.1) then
+        return jukebox.pos_ms or 0;
+    end
+    jukebox.pos_time = now;
+    jukebox.pos_ms = tonumber(jukebox.mci('status ' .. jukebox.alias .. ' position', true) or '') or 0;
+    return jukebox.pos_ms;
+end
+
+-- Per-frame housekeeping, rate-limited: handle the end of a track, the
+-- window closing, and logout.
+function jukebox.tick()
+    if (not jukebox.active) then return; end
+    if (not gui_state.is_open[1]) then
+        jukebox.return_live();
+        return;
+    end
+    local now = os.clock();
+    if ((now - jukebox.last_poll) < 0.25) then return; end
+    jukebox.last_poll = now;
+
+    local login_status = nil;
+    pcall(function()
+        login_status = AshitaCore:GetMemoryManager():GetPlayer():GetLoginStatus();
+    end);
+    if (login_status == 0) then
+        jukebox.stop(false);
+        return;
+    end
+
+    local player = GetPlayerEntity();
+    local status = (player ~= nil) and (player.Status or 0) or 0;
+    if (status == 1 or status == 2 or status == 3) then
+        jukebox.return_live();
+        print(chat.header('ZoneMusic'):append(chat.message(
+            (status == 1) and 'Preview stopped: you entered battle.' or 'Preview stopped.')));
+        return;
+    end
+
+    -- A paused (or paused-then-seeked) device reports stopped too; only an
+    -- unpaused stop is the end of the track.
+    if (jukebox.paused) then return; end
+    local mode = jukebox.mci('status ' .. jukebox.alias .. ' mode', true);
+    if (mode == nil or string.lower(mode) == 'stopped') then
+        jukebox.finished();
+    end
+end
+
+-- Everything the Crystal window needs, in one place. zm_ui.lua never
+-- touches addon locals directly; it reads this table.
+jukebox.ui = {
+    gui_state = gui_state,
+    jukebox = jukebox,
+    is_zone_disabled = is_zone_disabled,
+    set_zone_disabled = set_zone_disabled,
+    render_settings_page = render_settings_page,
+    save_settings = save_settings,
+    zone_name = jukebox.zone_name,
+    catalog = function()
+        return jukebox.catalog or jukebox.build_catalog();
+    end,
+    current_zone = function()
+        local zid = 0;
+        pcall(function() zid = AshitaCore:GetMemoryManager():GetParty():GetMemberZone(0) or 0; end);
+        return zid;
+    end,
+    canonical_zone = get_canonical_zone,
+    -- True when the addon (not the engine) owns audio in this zone, so a
+    -- preview plays alone rather than on top of the game's music.
+    -- Cached for 2s because has_zonemusic_assets opens files on disk.
+    owns_zone = function(zid)
+        local c = jukebox.owns_cache;
+        local now = os.clock();
+        if (c == nil or c.zid ~= zid or (now - c.t) > 2.0) then
+            c = { zid = zid, t = now,
+                  value = zone_is_covered_expansion(zid) and has_zonemusic_assets(zid) };
+            jukebox.owns_cache = c;
+        end
+        return c.value;
+    end,
+    live = function()
+        return {
+            enabled = music_config.enabled,
+            state = current_state,
+            zone_playing = zone_is_playing,
+            zone_paused = zone_is_paused,
+            battle_playing = battle_is_playing and not battle_is_silent,
+            zone_track = current_zone_track_display ~= '' and current_zone_track_display or current_zone_track,
+            battle_track = current_battle_track_display ~= '' and current_battle_track_display or current_battle_track,
+        };
+    end,
+    set_addon_enabled = function(on) jukebox.set_addon_enabled(on); end,
+    run_doctor = function() return jukebox.run_doctor(); end,
+    doctor_report = function() return jukebox.last_report; end,
+    report_error = function(source, err) jukebox.report_error(source, err); end,
+    dat_overlay = function() return jukebox.detect_dat_overlay(); end,
+    set_volume_percent = function(pct)
+        music_config.volume = pct * 10;
+        if (zone_is_playing or zone_is_paused) then
+            if (zone_fading) then zone_target_vol = music_config.volume;
+            else zone_current_vol = music_config.volume; end
+        end
+        if (battle_is_playing and not battle_is_silent) then
+            if (battle_fading) then battle_target_vol = music_config.volume;
+            else battle_current_vol = music_config.volume; end
+        end
+    end,
+};
+
 -- 7. Loops
 local timer = 0;
 ashita.events.register('d3d_present', 'bard_music_tick', function ()
-    poll_engine_signal();
-    pcall(update_idle_replay);
+    jukebox.guard('engine signal', poll_engine_signal);
+    jukebox.guard('idle replay', update_idle_replay);
     -- Update fades every frame (state-only, no MCI calls)
-    pcall(update_fades);
-    
+    jukebox.guard('fades', update_fades);
+
     -- Update ducking every frame (state-only, no MCI calls)
-    pcall(update_ducking);
-    
+    jukebox.guard('ducking', update_ducking);
+
     -- Single source of truth for MCI volume commands. Applies
     -- final = base_volume * duck_multiplier per alias, with dedupe in
     -- set_volume to skip MCI when the integer value hasn't changed.
     -- This eliminates the per-frame double-set that was causing audible
     -- stutter during fade+duck overlap.
-    pcall(apply_volumes);
-    
+    jukebox.guard('volume', apply_volumes);
+
     if not init_complete then
         if init_timer == 0 then
             init_timer = os.clock();
@@ -3729,11 +5452,14 @@ ashita.events.register('d3d_present', 'bard_music_tick', function ()
                     pcall(inject_engine_music, 3, ENGINE_SILENCE_ID);  -- Battle Party
                     pcall(inject_engine_music, 4, ENGINE_SILENCE_ID);  -- Mount
                 end
+                -- Pre-silence the Mog House slot so the first entry this
+                -- session never lets music126 through.
+                pcall(jukebox.mh_prime);
                 pcall(update_music);
             end
         end
     end
-    
+
     -- PER-FRAME cutscene local-lock latch. update_music runs only every 0.5s,
     -- but a real cutscene flashes the player's local Status == 4 for as little
     -- as a single game frame at its start. Sampling only every 0.5s would miss
@@ -3753,7 +5479,10 @@ ashita.events.register('d3d_present', 'bard_music_tick', function ()
 
     if (os.clock() - timer > 0.5) then
         timer = os.clock();
-        pcall(update_music);
+        -- A jukebox preview holds the DJ; live music picks up when it ends.
+        if (not jukebox.active) then
+            jukebox.guard('music', update_music);
+        end
 
         -- Fishing state cleanup — status-based detection is the primary
         -- end-of-fishing signal. When the player's Status drops out of the
@@ -3803,367 +5532,11 @@ ashita.events.register('d3d_present', 'bard_music_tick', function ()
         end
     end
 
+    jukebox.guard('jukebox', jukebox.tick);
+    jukebox.guard('battle watchdog', jukebox.battle_watchdog);
+    jukebox.guard('health check', jukebox.startup_check);
     if (not gui_state.is_open[1]) then return; end
-
-    local nav_labels = { 'Status', 'Battle', 'Playback', 'Fade & Duck', 'Events' };
-    local zm_page = gui_state.zm_page or { 0 };
-    gui_state.zm_page = zm_page;
-
-    local NAV_W = 112;
-
-    -- Default size; the window is user-resizable so the long descriptive
-    -- lines can be revealed by dragging the window edge wider.
-    imgui.SetNextWindowSize({ 600, 0 }, ImGuiCond_Once);
-    if (imgui.Begin('ZoneMusic', gui_state.is_open)) then
-
-        -- LEFT NAV
-        imgui.BeginGroup();
-        imgui.PushItemWidth(NAV_W);
-
-        local status_col = music_config.enabled and {0.2,0.8,0.3,1.0} or {0.8,0.2,0.2,1.0};
-        imgui.TextColored(status_col, music_config.enabled and 'PLAYING' or 'STOPPED');
-
-        -- Zone status short
-        local zs = zone_is_playing and 'Zone ♪' or (zone_is_paused and 'Zone ‖' or 'Zone —');
-        local bs = battle_is_playing and (battle_is_silent and 'Battle ‖' or 'Battle ♪') or '';
-        imgui.TextColored({0.5,0.7,1.0,1.0}, zs);
-        if bs ~= '' then imgui.TextColored({1.0,0.6,0.3,1.0}, bs); end
-
-        imgui.Spacing(); imgui.Separator(); imgui.Spacing();
-
-        for i, lbl in ipairs(nav_labels) do
-            local active = (zm_page[1] == i - 1);
-            imgui.PushStyleColor(ImGuiCol_Button,        active and {0.25,0.45,0.75,1.0} or {0.15,0.15,0.20,1.0});
-            imgui.PushStyleColor(ImGuiCol_ButtonHovered, active and {0.30,0.52,0.85,1.0} or {0.20,0.30,0.45,1.0});
-            if imgui.Button(lbl, {NAV_W, 22}) then zm_page[1] = i - 1; end
-            imgui.PopStyleColor(2);
-        end
-
-        imgui.Spacing(); imgui.Separator(); imgui.Spacing();
-
-        -- Play / Stop in nav
-        imgui.PushStyleColor(ImGuiCol_Button,        {0.15,0.45,0.15,1.0});
-        imgui.PushStyleColor(ImGuiCol_ButtonHovered, {0.20,0.60,0.20,1.0});
-        if imgui.Button('Play', {NAV_W, 22}) then
-            music_config.enabled = true;
-            gui_state.enabled[1] = true;
-            clear_idle_replay();
-            update_music();
-        end
-        imgui.PopStyleColor(2);
-
-        imgui.PushStyleColor(ImGuiCol_Button,        {0.45,0.15,0.15,1.0});
-        imgui.PushStyleColor(ImGuiCol_ButtonHovered, {0.60,0.20,0.20,1.0});
-        if imgui.Button('Stop', {NAV_W, 22}) then
-            stop_all_music();
-            music_config.enabled = false;
-            gui_state.enabled[1] = false;
-        end
-        imgui.PopStyleColor(2);
-
-        imgui.PopItemWidth();
-        imgui.EndGroup();
-        imgui.SameLine();
-
-        -- CONTENT (width tracks the window so it can be expanded by dragging)
-        local CONTENT_W = 440;
-        local win_w = imgui.GetWindowWidth and imgui.GetWindowWidth();
-        if (win_w and win_w > 0) then
-            CONTENT_W = win_w - NAV_W - 40;
-        end
-        if (CONTENT_W < 240) then CONTENT_W = 240; end
-        imgui.BeginGroup();
-        imgui.PushItemWidth(CONTENT_W - 10);
-
-        local function zm_section(label)
-            imgui.TextColored({0.45,0.65,0.85,1.0}, label);
-            imgui.Separator();
-        end
-
-        -- PAGE 0: STATUS
-        if zm_page[1] == 0 then
-            zm_section('Volume');
-            imgui.SetNextItemWidth(CONTENT_W - 50);
-            if imgui.SliderInt('##zmvol', gui_state.volume, 0, 100) then
-                music_config.volume = gui_state.volume[1] * 10;
-                if zone_is_playing or zone_is_paused then
-                    if zone_fading then zone_target_vol = music_config.volume;
-                    else zone_current_vol = music_config.volume; set_volume(zone_alias, music_config.volume); end
-                end
-                if battle_is_playing and not battle_is_silent then
-                    if battle_fading then battle_target_vol = music_config.volume;
-                    else battle_current_vol = music_config.volume; set_volume(battle_alias, music_config.volume); end
-                end
-            end
-            imgui.SameLine();
-            imgui.TextColored({0.5,1.0,0.5,1.0}, string.format('%d%%', gui_state.volume[1]));
-
-            imgui.Spacing();
-            zm_section('Current State');
-            imgui.TextColored({0.7,0.7,0.7,1.0}, current_state);
-
-            local party = AshitaCore:GetMemoryManager():GetParty();
-            local zone_id = party:GetMemberZone(0);
-            local hp_per = party:GetMemberHPPercent(0);
-            local vana_hour = get_vana_hour();
-            local is_night = (vana_hour >= 18) or (vana_hour < 6);
-
-            imgui.Text(string.format('Zone %d  |  HP %d%%  |  Vana %02d:00 (%s)',
-                zone_id, hp_per, vana_hour, is_night and 'Night' or 'Day'));
-
-            if in_crisis_mode then
-                imgui.TextColored({1.0,0.4,0.4,1.0}, string.format('Crisis  |  Threshold %d%%', music_config.low_hp_threshold));
-            else
-                imgui.TextColored({0.5,0.5,0.5,1.0}, string.format('No crisis  |  Threshold %d%%', music_config.low_hp_threshold));
-            end
-
-            imgui.Spacing();
-            zm_section('Now Playing');
-            imgui.Spacing();
-            local zone_display = (current_zone_track_display ~= "")
-                and current_zone_track_display or current_zone_track;
-            local zone_status = zone_is_playing and (zone_display .. ' ♪')
-                             or (zone_is_paused and (zone_display .. ' ‖'))
-                             or (idle_replay.pending and (zone_display .. ' · waiting'))
-                             or '—';
-            imgui.Text('Zone:   ' .. zone_status);
-            if idle_replay.pending then
-                imgui.TextColored({0.5,0.7,1.0,1.0},
-                    string.format('Replay in %.0fs', math.max(0, idle_replay.due - os.clock())));
-            end
-
-            if battle_is_playing then
-                local battle_display = (current_battle_track_display ~= "")
-                    and current_battle_track_display or current_battle_track;
-                if battle_is_silent then
-                    local rw = music_config.battle_resume_window or 60;
-                    local rem = math.max(0, rw - (os.clock() - battle_silent_time));
-                    imgui.TextColored({1.0,0.8,0.2,1.0},
-                        string.format('Battle: %s (silent %.0fs)', battle_display, rem));
-                else
-                    imgui.Text('Battle: ' .. battle_display);
-                end
-            end
-
-            if duck_current_vol < 0.99 then
-                imgui.TextColored({1.0,0.8,0.2,1.0},
-                    string.format('Ducked → %d%%', math.floor(duck_current_vol * 100)));
-            end
-
-        -- PAGE 1: BATTLE
-        elseif zm_page[1] == 1 then
-            zm_section('Battle Music');
-            imgui.Checkbox('Enable Battle Music', gui_state.use_battle);
-
-            imgui.Spacing();
-            zm_section('Style');
-            if imgui.RadioButton('Solo and Party', gui_state.battle_mode[1] == 0) then
-                gui_state.battle_mode[1] = 0; music_config.battle_mode = 0;
-            end
-            imgui.SameLine();
-            if imgui.RadioButton('Solo', gui_state.battle_mode[1] == 1) then
-                gui_state.battle_mode[1] = 1; music_config.battle_mode = 1;
-            end
-            imgui.SameLine();
-            if imgui.RadioButton('Party', gui_state.battle_mode[1] == 2) then
-                gui_state.battle_mode[1] = 2; music_config.battle_mode = 2;
-            end
-
-            if imgui.Checkbox('Random Any Zone Battle Music', gui_state.random_battle) then
-                music_config.random_battle = gui_state.random_battle[1];
-                if gui_state.random_battle[1] then
-                    scan_battle_tracks();
-                    current_random_track = '';
-                end
-            end
-
-            imgui.Spacing();
-            zm_section('Dynamic Mode');
-
-            local dyn_on = gui_state.battle_dynamic[1];
-            local dyn_col = dyn_on and {0.1,0.5,0.1,1.0} or {0.35,0.35,0.35,1.0};
-            local dyn_hov = dyn_on and {0.2,0.7,0.2,1.0} or {0.5,0.5,0.5,1.0};
-            imgui.PushStyleColor(ImGuiCol_Button, dyn_col);
-            imgui.PushStyleColor(ImGuiCol_ButtonHovered, dyn_hov);
-            if imgui.Button(dyn_on and 'Dynamic ON' or 'Dynamic OFF', {CONTENT_W - 10, 22}) then
-                gui_state.battle_dynamic[1] = not dyn_on;
-                music_config.battle_dynamic = gui_state.battle_dynamic[1];
-                if dyn_on and battle_is_silent then
-                    stop_battle_music_instant();
-                    current_battle_track = ''; current_random_track = '';
-                    zone_coinflip_active = false; zone_coinflip_suffix = '';
-                end
-            end
-            imgui.PopStyleColor(2);
-
-            if gui_state.battle_dynamic[1] then
-                imgui.Text('Resume Window');
-                imgui.SetNextItemWidth(CONTENT_W - 50);
-                if imgui.SliderInt('##resumewin', gui_state.battle_resume_window, 10, 120) then
-                    music_config.battle_resume_window = gui_state.battle_resume_window[1];
-                end
-                imgui.SameLine();
-                imgui.TextColored({0.5,0.5,0.5,1.0}, string.format('%ds', gui_state.battle_resume_window[1]));
-                if battle_is_silent then
-                    local rw = music_config.battle_resume_window or 60;
-                    local rem = math.max(0, rw - (os.clock() - battle_silent_time));
-                    imgui.TextColored({1.0,0.8,0.2,1.0}, string.format('Re-engage: %.0fs left', rem));
-                end
-            end
-
-            imgui.Spacing();
-            imgui.Text('Battle Delay');
-            imgui.SetNextItemWidth(CONTENT_W - 50);
-            if imgui.SliderInt('##batdelay', gui_state.delay, 0, 100) then
-                music_config.battle_delay = gui_state.delay[1] / 10;
-            end
-            imgui.SameLine();
-            imgui.TextColored({0.5,0.5,0.5,1.0}, string.format('%.1fs', gui_state.delay[1] / 10));
-            imgui.TextColored({0.5,0.5,0.5,1.0}, 'Delays battle/idle switching; it does not delay theme replays.');
-
-        -- PAGE 2: PLAYBACK
-        elseif zm_page[1] == 2 then
-            zm_section('Zone Music');
-            if imgui.Checkbox('Play zone themes', gui_state.use_zone) then
-                music_config.enable_zone = gui_state.use_zone[1];
-                clear_idle_replay();
-                update_music();
-            end
-            imgui.TextColored({0.5,0.5,0.5,1.0}, 'Off silences the zone theme while the addon stays on.');
-            imgui.Spacing();
-            zm_section('Idle Theme Replay');
-            if imgui.Checkbox('Enable idle replay', gui_state.use_idle_replay) then
-                music_config.enable_idle_replay = gui_state.use_idle_replay[1];
-                clear_idle_replay();
-                update_music();
-            end
-            if gui_state.use_idle_replay[1] then
-                imgui.TextColored({0.65,0.65,0.65,1.0}, 'After a zone theme finishes, wait before playing it again.');
-                imgui.Spacing();
-                imgui.Text('Replay after:');
-                imgui.SameLine();
-                imgui.SetNextItemWidth(CONTENT_W - 160);
-                if imgui.SliderFloat('##idlereplaydelay', gui_state.idle_replay_delay_min, 0, 10, '%.1f') then
-                    music_config.idle_replay_delay = math.floor(gui_state.idle_replay_delay_min[1] * 60 + 0.5); -- minutes -> seconds
-                end
-                imgui.SameLine();
-                imgui.TextColored({0.5,1.0,0.5,1.0}, 'minutes');
-                if gui_state.idle_replay_delay_min[1] <= 0 then
-                    imgui.TextColored({0.5,0.5,0.5,1.0}, '0 keeps continuous looping.');
-                else
-                    imgui.TextColored({0.5,0.5,0.5,1.0}, 'Idle themes play once, then wait before replaying.');
-                end
-            else
-                imgui.TextColored({0.5,0.5,0.5,1.0}, 'Idle replay disabled — the zone theme loops continuously.');
-            end
-
-        -- PAGE 3: FADE & DUCK
-        elseif zm_page[1] == 3 then
-            zm_section('Fade');
-            if imgui.Checkbox('Enable Fade In/Out', gui_state.use_fade) then
-                music_config.enable_fade = gui_state.use_fade[1];
-            end
-            if gui_state.use_fade[1] then
-                imgui.Text('Fade Duration');
-                imgui.SetNextItemWidth(CONTENT_W - 50);
-                if imgui.SliderInt('##fadedur', gui_state.fade_dur, 1, 50) then
-                    music_config.fade_duration = gui_state.fade_dur[1] / 10;
-                end
-                imgui.SameLine();
-                imgui.TextColored({0.5,0.5,0.5,1.0}, string.format('%.1fs', gui_state.fade_dur[1] / 10));
-
-                local fade_info = '';
-                if zone_fading then
-                    fade_info = string.format('Zone %d%%→%d%%',
-                        math.floor(zone_current_vol/10), math.floor(zone_target_vol/10));
-                end
-                if battle_fading then
-                    if fade_info ~= '' then fade_info = fade_info .. '  '; end
-                    fade_info = fade_info .. string.format('Battle %d%%→%d%%',
-                        math.floor(battle_current_vol/10), math.floor(battle_target_vol/10));
-                end
-                if fade_info ~= '' then
-                    imgui.TextColored({0.5,0.8,1.0,1.0}, fade_info);
-                end
-            end
-
-            imgui.Spacing();
-            zm_section('Voice Ducking');
-            if imgui.Checkbox('Duck when voices play', gui_state.use_duck) then
-                music_config.enable_duck = gui_state.use_duck[1];
-            end
-            if gui_state.use_duck[1] then
-                imgui.Text('Duck Level');
-                imgui.SetNextItemWidth(CONTENT_W - 50);
-                if imgui.SliderInt('##duckpct', gui_state.duck_pct, 0, 80) then
-                    music_config.duck_percent = gui_state.duck_pct[1];
-                end
-                imgui.SameLine();
-                imgui.TextColored({0.5,0.5,0.5,1.0}, string.format('%d%%', gui_state.duck_pct[1]));
-                if duck_current_vol < 0.99 then
-                    imgui.TextColored({1.0,0.8,0.2,1.0},
-                        string.format('Ducked → %d%%', math.floor(duck_current_vol * 100)));
-                end
-            end
-
-        -- PAGE 4: EVENTS
-        elseif zm_page[1] == 4 then
-            zm_section('Special Events');
-            imgui.Checkbox('Play NM Music', gui_state.use_nm);
-
-            imgui.Spacing();
-            imgui.Checkbox('Play Low HP Music', gui_state.use_lowhp);
-            if gui_state.use_lowhp[1] then
-                imgui.Text('HP Threshold');
-                imgui.SetNextItemWidth(CONTENT_W - 50);
-                imgui.SliderInt('##hpthresh', gui_state.low_hp, 1, 50);
-                imgui.SameLine();
-                imgui.TextColored({0.5,0.5,0.5,1.0}, string.format('%d%%', gui_state.low_hp[1]));
-            end
-
-            imgui.Spacing();
-            if imgui.Checkbox('Play Fishing Music', gui_state.use_fishing) then
-                music_config.enable_fishing = gui_state.use_fishing[1];
-            end
-            if gui_state.use_fishing[1] then
-                imgui.TextColored({0.5,0.5,0.5,1.0}, 'Small "!" bite: fishing_small.wav');
-                imgui.TextColored({0.5,0.5,0.5,1.0}, 'Large "!!!" bite: fishing_large.wav');
-                imgui.TextColored({0.5,0.5,0.5,1.0}, 'Fallback: fishing.wav (either type)');
-                if fishing_active then
-                    imgui.TextColored({1.0,0.8,0.2,1.0},
-                        string.format('Active: %s bite', fishing_bite_type or "?"));
-                end
-            end
-
-            imgui.Spacing();
-            if imgui.Checkbox('Play Mog House Music', gui_state.use_moghouse) then
-                music_config.enable_moghouse = gui_state.use_moghouse[1];
-            end
-            if gui_state.use_moghouse[1] then
-                imgui.TextColored({0.5,0.5,0.5,1.0}, 'moghouse.wav');
-                imgui.TextColored({0.5,0.5,0.5,1.0}, 'Detects nearby Moogle NPC (~12 yalms)');
-                if moghouse_active then
-                    imgui.TextColored({1.0,0.8,0.2,1.0}, 'Active: in Mog House');
-                end
-            end
-
-            imgui.Spacing();
-            if imgui.Checkbox('Play Chocobo Music', gui_state.use_chocobo) then
-                music_config.enable_chocobo = gui_state.use_chocobo[1];
-            end
-            if gui_state.use_chocobo[1] then
-                imgui.TextColored({0.5,0.5,0.5,1.0}, 'chocobo.wav');
-                imgui.TextColored({0.5,0.5,0.5,1.0}, 'Plays while mounted (Status 5)');
-            end
-        end
-
-        imgui.Spacing(); imgui.Separator();
-        if imgui.Button('Save Settings', {CONTENT_W - 10, 24}) then save_settings(); end
-
-        imgui.PopItemWidth();
-        imgui.EndGroup();
-    end
-    imgui.End();
+    jukebox.guard('window', zm_ui.render, jukebox.ui);
 end);
 
 -- === CHAT-BASED FISHING DETECTION ===
@@ -4419,6 +5792,23 @@ ashita.events.register('packet_in', 'zonemusic_packet_in', function(e)
         if (not e.injected) then
             engine_05f_seen_time = os.clock();
 
+            -- Mog House slot (block 6) from the server, e.g. Symphonic
+            -- Curator. Remember it as the native track for restore; while
+            -- the cover owns the room, block it so it cannot play underneath.
+            if (mtype == jukebox.MH_SLOT) then
+                if (song > 0) then jukebox.mh_native_song = song; end
+                local zid = 0;
+                pcall(function() zid = AshitaCore:GetMemoryManager():GetParty():GetMemberZone(0); end);
+                if (jukebox.mh_cover_ready(zid)) then
+                    e.blocked = true;
+                    jukebox.mh_slot_silenced = true;
+                    if (DEBUG_CUTSCENE) then
+                        zm_debug(string.format('Mog House slot 0x05F blocked (song=%d) - cover owns audio', song));
+                    end
+                end
+                return;
+            end
+
             -- NPC-TALK / RESIDENT RESEND vs REAL EVENT MUSIC.
             -- Retail-verified FFXI behavior: some events make the server
             -- resend the zone's RESIDENT track via 0x05F (NPC talks on
@@ -4429,12 +5819,20 @@ ashita.events.register('packet_in', 'zonemusic_packet_in', function(e)
             -- the cover. Any OTHER genuine track is real event music: hand
             -- off instantly, right here in the packet handler, so the WAV
             -- is silent before the engine track's first note.
+            -- Only block where the addon actually owns audio. Resident ids are
+            -- captured in every zone now, and in an uncovered or disabled zone
+            -- the engine's resend IS the music the player should hear.
+            local addon_owns_zone = false;
+            pcall(function()
+                addon_owns_zone = zone_is_covered_expansion(
+                    AshitaCore:GetMemoryManager():GetParty():GetMemberZone(0));
+            end);
             local rd, rn = saved_bgm_ids.day, saved_bgm_ids.night;
             local is_resident_resend =
-                (song >= 0)
+                addon_owns_zone and (song >= 0)
                 and (((rd ~= nil) and (song == rd)) or ((rn ~= nil) and (song == rn)));
             local is_covered_moghouse =
-                (song == 126)
+                addon_owns_zone and (song == 126)
                 and (music_config.enable_moghouse ~= false)
                 and file_exists("moghouse.wav");
 
@@ -4501,6 +5899,35 @@ ashita.events.register('packet_in', 'zonemusic_packet_in', function(e)
         -- play retail music normally.
         pcall(suppress_engine_bgm_in_zone_packet, e);
 
+        -- Mog House flag + same-city transit bookkeeping for the arrival.
+        pcall(function()
+            local zid = struct.unpack('H', e.data, 0x30 + 1);
+            -- 1 = inside a Mog House. LSB writes 2 on every ordinary zone-in,
+            -- so "nonzero" is not "inside" (zone_in.cpp, CZoneInPacket).
+            moghouse_zone_flag = (struct.unpack('b', e.data, 0x80 + 1) == 1);
+            if (moghouse_zone_flag) then
+                -- Inside: the cover owns the room from the first frame and
+                -- the client's native Mog House slot is silenced.
+                jukebox.mh_enter(zid);
+            else
+                -- Left (or never entered) a Mog House: end its music now,
+                -- and keep the native slot silenced so the NEXT entry starts
+                -- clean (silencing on entry lets music126 sound briefly).
+                moghouse_active = false;
+                jukebox.mh_prime();
+            end
+            if (DEBUG_CITY or DEBUG_CUTSCENE) then
+                zm_debug(string.format('ZONE IN %d moghouse_flag=%s transit=%s',
+                    zid, tostring(moghouse_zone_flag), tostring(city_transit.group)));
+            end
+            if (city_transit.group ~= nil and get_city_group(zid) == city_transit.group) then
+                city_transit.dest = zid;
+            else
+                city_transit.group = nil;
+                city_transit.dest = nil;
+            end
+        end);
+
         is_zoning = false;
         zoning_from_city = nil;
         packet_event_pending_start = 0;
@@ -4526,6 +5953,16 @@ ashita.events.register('packet_in', 'zonemusic_packet_in', function(e)
         -- Record the city group of the zone we're leaving. previous_zone_id
         -- still holds the zone we're standing in at the moment of zone-out.
         zoning_from_city = get_city_group(previous_zone_id);
+        -- Open the same-city transit window from the zone we are actually
+        -- standing in (party data is still valid at zone-out; previous_zone_id
+        -- only advances when a track starts).
+        pcall(function()
+            local here = AshitaCore:GetMemoryManager():GetParty():GetMemberZone(0);
+            local g = get_city_group(here) or zoning_from_city;
+            city_transit.group = g;
+            city_transit.dest = nil;
+            city_transit.started = os.clock();
+        end);
         was_in_cutscene = false;
         in_cutscene_from_packet = false;
         packet_event_pending_start = 0;
@@ -4537,6 +5974,26 @@ end);
 ashita.events.register('command', 'bard_cmd', function (e)
     local args = e.command:args();
     if (#args > 0 and (args[1] == '/zonemusic' or args[1] == '/zm')) then
+        if (#args > 1 and args[2] == 'zone') then
+            handle_zone_command(args);
+            e.blocked = true;
+            return;
+        end
+        if (#args > 1 and (args[2] == 'doctor' or args[2] == 'check')) then
+            jukebox.print_doctor();
+            e.blocked = true;
+            return;
+        end
+        if (#args > 1 and args[2] == 'jukebox') then
+            if (args[3] == 'rescan') then
+                jukebox.build_catalog();
+                print(chat.header('ZoneMusic'):append(chat.message('Jukebox catalog rebuilt.')));
+            end
+            gui_state.is_open[1] = true;
+            gui_state.ui_tab = 0;
+            e.blocked = true;
+            return;
+        end
         -- Debug command for ducking
         if (#args > 1 and args[2] == 'duck') then
             -- /zonemusic duck on/off - force enable/disable
@@ -4702,19 +6159,12 @@ ashita.events.register('command', 'bard_cmd', function (e)
             return;
         end
         if (#args > 1 and (args[2] == 'stop' or args[2] == 'off')) then
-            stop_all_music();
-            music_config.enabled = false;
-            gui_state.enabled[1] = false;
-            print(chat.header('ZoneMusic'):append(chat.message('Music stopped!')));
+            jukebox.set_addon_enabled(false);
             e.blocked = true;
             return;
         end
         if (#args > 1 and (args[2] == 'play' or args[2] == 'on')) then
-            music_config.enabled = true;
-            gui_state.enabled[1] = true;
-            clear_idle_replay();
-            update_music();
-            print(chat.header('ZoneMusic'):append(chat.success('Music playing!')));
+            jukebox.set_addon_enabled(true);
             e.blocked = true;
             return;
         end
@@ -4790,6 +6240,10 @@ ashita.events.register('command', 'bard_cmd', function (e)
             print(chat.message('  /zm random - Toggle random battle music'));
             print(chat.message('  /zm dynamic - Toggle dynamic battle mode (FFXIV-style resume)'));
             print(chat.message('  /zm fade - Toggle fade in/out'));
+            print(chat.message('  /zm zone on/off/toggle - Addon music in the current zone (whole city)'));
+            print(chat.message('  /zm zone list - Zones where the addon is off'));
+            print(chat.message('  /zm jukebox - Open the jukebox (rescan: re-read the sounds folder)'));
+            print(chat.message('  /zm doctor - Check the install and explain anything that is wrong'));
             print(chat.message('  /zm duck on/off - Toggle voice ducking'));
             print(chat.message('  /zm cutscene - Toggle cutscene debug'));
             print(chat.message('  /zm debug - Show current state'));
@@ -4810,6 +6264,10 @@ ashita.events.register('unload', 'bard_cleanup', function ()
     -- Save all settings using the proper function
     pcall(save_settings);
     
+    -- Give the client its Mog House music slot back.
+    pcall(jukebox.mh_release);
+
     -- Stop music instantly (no fade on unload)
+    pcall(jukebox.stop, false);
     pcall(stop_all_music_instant);
 end);
