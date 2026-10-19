@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.0.2 — 2026-10-18
+
+- Restricted Tenzen boss music to the engaged mission encounter in Sealion's Den; the same-named party trust no longer selects his boss theme.
+
 ## 2.0.1 — 2026-10-18
 
 - Added separate Shadow Lord phase-one and phase-two battle themes: shadow_battle.mp3 and shadow_battle_2.mp3.

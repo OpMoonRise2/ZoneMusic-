@@ -95,6 +95,7 @@ local real_open=io.open;local signal='2 121';
 io.open=function()return {read=function()return signal;end,close=function()end};end;
 struct={unpack=function(kind,data,pos)return pos==5 and data.slot or data.song;end};
 '''
+setup=setup.replace('local unique_nm_list={};',s[s.index('local unique_nm_list = {'):s.index('-- Debounce window for phase2 promotion')])
 intro_helpers=s[s.index('jukebox.shadow_intro = {};'):s.index('function jukebox.shadow_covers')]
 native=s[s.index('-- The native battle stream can arrive'):s.index('function jukebox.is_covered_engine_track')]
 covered=s[s.index('function jukebox.is_covered_engine_track'):s.index('-- End of an engine handoff:')]
@@ -209,6 +210,32 @@ clock=clock+1;signal='107 119';poll_engine_signal();
 assert(handoff.active and not jukebox.shadow_intro.locked and jukebox.shadow_intro.song==119);
 io.open=real_open;
 print('PASS: nil music ids on reload, first intro allowed, repeat lock, engage continuity, real later cutscene allowed, fresh ids preserved and next-visit reset');
+"""
+
+
+handoff_checks+=r"""
+player.Status=1;player.StatusServer=0;hp=100;covered=true;music_config.battle_delay=0;
+music_config.enabled=true;music_config.enable_battle=true;music_config.battle_mode=1;
+assets['tenzen_battle.wav']=true;assets['battle_default_solo.wav']=true;
+party.GetMemberZone=function(self,i)return (i==0 or i==1) and zone or 0;end;
+party.GetMemberServerId=function(self,i)return i==0 and 123 or (i==1 and 456 or 0);end;
+local function tenzen(z, sid)
+ zone=z;mobs={[10]={Name='Tenzen',ServerId=sid,Status=1,HPPercent=100}};
+ unique_nm_scan_result=nil;unique_nm_scan_timer=0;previous_status=1;
+ return tick();
+end
+-- The trust occupies party slot 1; allied identity must never win.
+assert(tenzen(100,456)~='tenzen_battle.wav','trust triggered boss music outside battlefield');
+assert(tenzen(32,456)~='tenzen_battle.wav','party trust triggered boss music inside battlefield');
+assert(tenzen(100,999)~='tenzen_battle.wav','same-named non-party entity triggered theme outside mission zone');
+assert(tenzen(32,999)=='tenzen_battle.wav','hostile mission Tenzen lost his theme');
+mobs[10].Status=0;unique_nm_scan_timer=0;unique_nm_scan_result=nil;
+assert(tick()~='tenzen_battle.wav','unengaged boss triggered theme');
+assert(tenzen(32,nil)~='tenzen_battle.wav','unknown identity accepted');
+zone=154;mobs={[10]={Name='Fafnir',ServerId=999,Status=1,HPPercent=100}};
+assets['fafnir_battle.wav']=true;unique_nm_scan_timer=0;unique_nm_scan_result=nil;
+assert(tick()=='fafnir_battle.wav','unrelated boss selection changed');
+print('PASS: Tenzen trust excluded inside/outside mission zone; hostile engaged mission boss allowed; unknown/unengaged identity excluded; other bosses unchanged');
 """
 
 setup=setup.replace('MODULE_PATH',json.dumps(root.as_posix()+'/?.lua;'))

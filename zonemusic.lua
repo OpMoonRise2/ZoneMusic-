@@ -1,6 +1,6 @@
 addon.name      = 'ZoneMusic';
 addon.author    = 'MoonRise (Eldorin)';
-addon.version   = '2.0.1';
+addon.version   = '2.0.2';
 addon.desc      = 'Dynamic Zone Themes and Battle Themes /zm for gui';
 addon.link      = '';
 
@@ -874,9 +874,8 @@ local unique_nm_list = {
     ["Omega"] = "omega_battle.wav",
     ["Ultima"] = "ultima_battle.wav",
     -- Tenzen (PM 7-5) — his own theme instead of the battle_32 fallback.
-    -- Simple string entry: fires when the "Tenzen" entity is engaged,
-    -- identical mechanism to Omega/Ultima above. Requires
-    -- tenzen_battle.wav in the sounds folder.
+    -- Only the hostile mission encounter in Sealion's Den may select this
+    -- theme. The scanner excludes the same-named trust in the party.
     ["Tenzen"] = "tenzen_battle.wav",
 
     -- Monarch Linn (zone 31) — CoP mission 4-2 "The Savage" + Storms of Fate
@@ -2317,7 +2316,11 @@ local function get_desired_track()
                         local ent = GetEntity(j);
                         if (ent ~= nil and ent.Name ~= nil) then
                             local entry = unique_nm_list[ent.Name];
-                            if (entry ~= nil) then
+                            -- The trust shares the boss's name and engaged status.
+                            -- Require the mission zone and exclude allied party ids.
+                            if (entry ~= nil and (ent.Name ~= 'Tenzen'
+                                or (zone_id == 32 and ent.ServerId ~= nil
+                                    and not party_server_ids[ent.ServerId]))) then
                                 if (type(entry) == "table" and entry.phase_companions) then
                                     -- Phased boss: match on presence (engaged
                                     -- check happens in the phased block below).
