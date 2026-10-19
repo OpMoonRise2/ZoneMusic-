@@ -1,6 +1,6 @@
 # Maintenance state
 
-## Release 1.3.1
+## Release 2.0.1
 
 `zonemusic.lua` owns track selection, playback and native-music handover; `zm_shadow.lua` owns Shadow Lord phase state; `zm_ui.lua` owns the GUI; `zm_doctor.lua` provides installation checks. Keep all four Lua files together. Audio and DAT overlays are separate Nexus assets; keep the Nexus download link in README.
 

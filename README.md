@@ -1,6 +1,6 @@
 # ZoneMusic
 
-Dynamic zone and battle music for Ashita v4. Version **1.3.1**.
+Dynamic zone and battle music for Ashita v4. Version **2.0.1**.
 
 ## Download the audio package
 
@@ -20,7 +20,7 @@ Extract the complete Nexus archive into your Ashita folder. Confirm these files 
 
 Add `zonemusicDATS` to your Pivot overlay list while preserving other entries. Load `/load ZMHelper` and `/addon load zonemusic`. Open settings with `/zm`; use `/zm doctor` for installation checks. Preserve your existing character settings when updating.
 
-Existing 1.3.0 users can install the smaller 1.3.1 update over their current installation. It contains the four Lua files and the two new Shadow Lord tracks; it requires the existing audio library, helper plugin and DAT overlay. The full 1.3.1 package includes all 427 MP3 recordings, the helper and the 72 overlay files.
+Existing 2.0.0 users can install the smaller 2.0.1 update over their current installation. It contains the four Lua files and the two new Shadow Lord tracks; it requires the existing audio library, helper plugin and DAT overlay. The full 2.0.1 package includes all 427 MP3 recordings, the helper and the 72 overlay files.
 
 ## Shadow Lord music
 

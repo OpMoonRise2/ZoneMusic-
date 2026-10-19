@@ -1,6 +1,6 @@
 addon.name      = 'ZoneMusic';
 addon.author    = 'MoonRise (Eldorin)';
-addon.version   = '1.3.1';
+addon.version   = '2.0.1';
 addon.desc      = 'Dynamic Zone Themes and Battle Themes /zm for gui';
 addon.link      = '';
 

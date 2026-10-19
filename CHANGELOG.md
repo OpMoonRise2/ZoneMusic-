@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.3.1 — 2026-10-18
+## 2.0.1 — 2026-10-18
 
 - Added separate Shadow Lord phase-one and phase-two battle themes: shadow_battle.mp3 and shadow_battle_2.mp3.
 - Kept the Throne Room day theme unchanged; solo and party engagement select the same boss theme.
