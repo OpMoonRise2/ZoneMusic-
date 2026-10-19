@@ -1,21 +1,39 @@
 # ZoneMusic
 
-## Download the complete audio package
+Dynamic zone and battle music for Ashita v4. Version **1.3.1**.
 
-**[Download ZoneMusic and its accompanying audio package on Nexus Mods](https://www.nexusmods.com/finalfantasy11/mods/34).**
+## Download the audio package
 
-GitHub contains the addon source and documentation. To hear the supplied recordings, install the complete package from Nexus Mods; the GitHub source ZIP does not include the audio library.
-
-Dynamic zone and battle music for Ashita v4. Runtime version: 1.3.0.
+**[Download ZoneMusic with its accompanying audio package on Nexus Mods](https://www.nexusmods.com/finalfantasy11/mods/34).** GitHub contains the addon source, documentation and helper binary. Audio and DAT overlays are distributed through Nexus; the GitHub source ZIP does not contain the music library.
 
 ## Install
 
-Copy `zonemusic.lua`, `zm_ui.lua` and `zm_doctor.lua` to `Ashita/addons/zonemusic/`. Copy `ZMHelper.dll` to `Ashita/plugins/`. Put the separately supplied `sounds/` folder beside the Lua files, and the `zonemusicDATS` overlay under `Ashita/polplugins/DATs/`.
+Extract the complete Nexus archive into your Ashita folder. Confirm these files exist:
 
-Add `zonemusicDATS` to your Pivot overlay list while preserving other entries. Load `/load ZMHelper` and `/addon load zonemusic`. Open the menu with `/zm`; run `/zm doctor` to inspect installation health.
+- `addons/zonemusic/zonemusic.lua`
+- `addons/zonemusic/zm_ui.lua`
+- `addons/zonemusic/zm_doctor.lua`
+- `addons/zonemusic/zm_shadow.lua`
+- `addons/zonemusic/sounds/`
+- `plugins/ZMHelper.dll`
+- `polplugins/DATs/zonemusicDATS/`
 
-This prepared asset snapshot contains 427 MP3 recordings. The music library and DAT replacements are separate from the Git source bundle. The helper creates `engine_music.signal` at runtime; do not ship or track a signal captured from another session. Character settings, live configuration files, logs and backups are excluded.
+Add `zonemusicDATS` to your Pivot overlay list while preserving other entries. Load `/load ZMHelper` and `/addon load zonemusic`. Open settings with `/zm`; use `/zm doctor` for installation checks. Preserve your existing character settings when updating.
 
-The deployed helper DLL is byte-identical to the current upstream binary. Its build source is not included in this repository snapshot.
+Existing 1.3.0 users can install the smaller 1.3.1 update over their current installation. It contains the four Lua files and the two new Shadow Lord tracks; it requires the existing audio library, helper plugin and DAT overlay. The full 1.3.1 package includes all 427 MP3 recordings, the helper and the 72 overlay files.
 
-For the complete published installation package, use the [Nexus Mods release](https://www.nexusmods.com/finalfantasy11/mods/34).
+## Shadow Lord music
+
+`sounds/shadow_battle.mp3` plays during phase one; `sounds/shadow_battle_2.mp3` plays during phase two. `day_165.mp3` remains the room's idle theme. Solo and party engagement use the same boss override.
+
+The phase-one defeat message arms the phase transition. A replacement or newly engaged boss after the entity gap selects phase two; Implosion provides a fallback when loading during phase two. Re-engaging alone does not advance the phase. The current theme holds through a brief entity gap (up to 20 seconds). Battlefield clear ends the encounter; zoning and logout reset it.
+
+Covered native battle streams no longer interrupt engagement. Missing music IDs after an in-zone reload are recovered from stored settings, preserving fresh packet values. Once the intro ends, its native score cannot take ownership again outside actual event windows during that visit. Genuine later cutscenes retain their music. The lock resets on zone entry/departure or logout.
+
+If phase two is missing, phase one continues. With both new tracks absent, existing battle selection remains available.
+
+## Verification and maintenance
+
+The author confirmed the final encounter behavior in live testing on 2026-10-18, including the teleport-exit fix. Automated regressions exercise selection, phase changes, native packet/helper handovers, reload recovery and intro replay. Run `python tests/test_shadow_music.py` with a Lua interpreter available (or set `LUA` to its path). These checks do not replace live testing of every zone or cutscene.
+
+Character configuration, runtime signals, debug captures and backups are excluded from releases. The helper binary is unchanged from the prior upstream version; its build source is not included here. See [CHANGELOG.md](CHANGELOG.md) for release changes and [MAINTENANCE.md](MAINTENANCE.md) for project state.

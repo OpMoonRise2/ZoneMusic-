@@ -1,6 +1,6 @@
 addon.name      = 'ZoneMusic';
 addon.author    = 'MoonRise (Eldorin)';
-addon.version   = '1.3.0';
+addon.version   = '1.3.1';
 addon.desc      = 'Dynamic Zone Themes and Battle Themes /zm for gui';
 addon.link      = '';
 
@@ -1944,6 +1944,39 @@ local function suppress_engine_bgm_in_zone_packet(e)
 end
 
 -- 5. The DJ Logic
+-- Keep boss state on the existing helper table to respect the runtime's
+-- per-function upvalue limit in update_music.
+jukebox.shadow = require('zm_shadow').new();
+function jukebox.shadow_track()
+    local party = AshitaCore:GetMemoryManager():GetParty();
+    local zone = party:GetMemberZone(0);
+    local player = GetPlayerEntity();
+    if (zone ~= 165) then
+        jukebox.shadow:reset();
+        jukebox.shadow_reset_intro();
+        return nil;
+    end
+    if (not music_config.enabled or not music_config.enable_battle
+        or not zone_is_covered_expansion(zone) or player == nil
+        or player.Status == 2 or party:GetMemberHPPercent(0) == 0
+        or (player.StatusServer or 0) == 4) then return nil; end
+    local now = os.clock();
+    if (now >= (jukebox.shadow_poll or 0)) then
+        jukebox.shadow_poll = now + 0.25;
+        local boss = nil;
+        for i = 0, 2303 do
+            local ent = GetEntity(i);
+            if (ent ~= nil and (ent.Name == 'Shadow Lord' or ent.Name == 'The Shadow Lord')
+                and ent.Status == 1 and (ent.HPPercent == nil or ent.HPPercent > 0)) then
+                boss = ent.ServerId or i;
+                break;
+            end
+        end
+        jukebox.shadow:observe(boss, now);
+    end
+    return jukebox.shadow:track(now, file_exists);
+end
+
 local function get_desired_track()
     local player_ent = GetPlayerEntity();
     if (player_ent == nil) then 
@@ -2054,6 +2087,27 @@ local function get_desired_track()
             idle_track = prefix .. "_default.wav";
         elseif file_exists("idle_default.wav") then
             idle_track = "idle_default.wav";
+        end
+    end
+
+    -- Boss engagement bypasses generic entry/exit delays. The encounter keeps
+    -- its theme through the short entity gap between phases.
+    if (zone_id == 165 and music_config.enable_battle) then
+        local shadow_track = jukebox.shadow_track();
+        if (shadow_track ~= nil) then
+            battle_start_timer = 0;
+            battle_end_timer = 0;
+            previous_status = status;
+            unique_nm_scan_result = shadow_track;
+            last_unique_nm_track = shadow_track;
+            current_state = 'Shadow Lord (Phase ' .. jukebox.shadow.phase .. ')';
+            return shadow_track;
+        elseif (jukebox.shadow.finished and status ~= 2 and hp_per > 0) then
+            battle_start_timer = 0;
+            battle_end_timer = 0;
+            previous_status = status;
+            unique_nm_scan_result = nil;
+            return idle_track;
         end
     end
 
@@ -2973,6 +3027,127 @@ end
 -- the zone's resident day/night theme, or Mog House track 126 when the
 -- moghouse.wav cover is in use. Mirrors the 0x05F handler's resident/covered
 -- block so the ZMHelper signal poll classifies engine starts the same way.
+-- Only battle-slot packets and known battle ids are covered here. Actual
+-- event windows always retain native music ownership.
+jukebox.shadow_intro = {};
+
+-- A reload inside the battlefield may precede any fresh zone packet.
+-- Recover missing fields only; fresh packet values always win.
+function jukebox.shadow_recover_bgm()
+    if (AshitaCore:GetMemoryManager():GetParty():GetMemberZone(0) ~= 165) then return; end
+    local saved = music_config.zone_bgm and music_config.zone_bgm['165'];
+    if (saved == nil) then return; end
+    for _, key in ipairs({'day', 'night', 'solo', 'party', 'mount'}) do
+        if (saved_bgm_ids[key] == nil) then saved_bgm_ids[key] = saved[key]; end
+    end
+end
+
+function jukebox.shadow_reset_intro()
+    jukebox.shadow_intro = {};
+end
+
+-- Remember only the battlefield's own battle score heard inside an event.
+-- The lock applies outside event windows so later actual scenes retain music.
+function jukebox.shadow_note_intro(song)
+    local player = GetPlayerEntity();
+    if (not music_config.enabled or not music_config.enable_battle or player == nil
+        or (player.StatusServer or 0) ~= 4
+        or AshitaCore:GetMemoryManager():GetParty():GetMemberZone(0) ~= 165
+        or not zone_is_covered_expansion(165)) then return; end
+    jukebox.shadow_recover_bgm();
+    if (song ~= nil and song > 0 and not jukebox.shadow_intro.locked
+        and (song == saved_bgm_ids.solo or song == saved_bgm_ids.party)
+        and (file_exists('shadow_battle.wav') or file_exists('shadow_battle_2.wav'))) then
+        jukebox.shadow_intro.song = song;
+    end
+end
+
+function jukebox.shadow_lock_intro()
+    local player = GetPlayerEntity();
+    if (player == nil or (player.StatusServer or 0) == 4) then return; end
+    if (jukebox.shadow_intro.song ~= nil and not jukebox.shadow_intro.locked) then
+        jukebox.shadow_intro.locked = true;
+        if (DEBUG_CUTSCENE) then
+            zm_debug('Shadow intro completed; repeat native music ' .. jukebox.shadow_intro.song
+                .. ' locked outside events until next zone entry/logout');
+        end
+    end
+end
+
+function jukebox.shadow_covers(song, slot)
+    if (jukebox.shadow_track() == nil) then return false; end
+    jukebox.shadow_recover_bgm();
+    if (slot ~= nil and slot ~= 2 and slot ~= 3) then return false; end
+    return (song ~= nil and song > 0) and
+        (song == 121 or song == saved_bgm_ids.solo or song == saved_bgm_ids.party);
+end
+
+-- The native battle stream can arrive before the boss becomes engaged.
+-- During that gap the installed room theme owns audio, not an event handoff.
+function jukebox.shadow_native_covers(song, slot)
+    local zone = AshitaCore:GetMemoryManager():GetParty():GetMemberZone(0);
+    local player = GetPlayerEntity();
+    if (zone ~= 165 or not music_config.enabled or is_zoning or player == nil
+        or player.Status == 2 or (player.StatusServer or 0) == 4
+        or AshitaCore:GetMemoryManager():GetParty():GetMemberHPPercent(0) == 0
+        or not zone_is_covered_expansion(zone)) then return false; end
+    jukebox.shadow_recover_bgm();
+    if (song == nil or song <= 0) then return false; end
+    if (slot == nil or slot == 0 or slot == 1) then
+        if (music_config.enable_zone ~= false
+            and (song == saved_bgm_ids.day or song == saved_bgm_ids.night)
+            and (file_exists('day_165.wav') or file_exists('night_165.wav'))) then
+            return true;
+        end
+    end
+    if (slot == nil or slot == 2 or slot == 3) then
+        if (music_config.enable_battle and
+            (song == saved_bgm_ids.solo or song == saved_bgm_ids.party
+                or (jukebox.shadow_intro.locked and song == jukebox.shadow_intro.song))) then
+            if (jukebox.shadow_covers(song, slot)) then return true; end
+            return music_config.enable_zone ~= false
+                and (file_exists('day_165.wav') or file_exists('night_165.wav'))
+                and (file_exists('shadow_battle.wav') or file_exists('shadow_battle_2.wav'));
+        end
+    end
+    return false;
+end
+
+function jukebox.shadow_prime_engine(reason)
+    jukebox.shadow_recover_bgm();
+    local changed = false;
+    local ids = {saved_bgm_ids.day, saved_bgm_ids.night, saved_bgm_ids.solo, saved_bgm_ids.party};
+    for slot = 0, 3 do
+        if (jukebox.shadow_native_covers(ids[slot + 1], slot)) then
+            inject_engine_music(slot, ENGINE_SILENCE_ID);
+            changed = true;
+        end
+    end
+    if (changed and DEBUG_CUTSCENE) then
+        zm_debug('Shadow native slots primed: ' .. tostring(reason));
+    end
+    return changed;
+end
+
+-- Sample event exit each frame, before the helper poll and the 0.5s DJ tick.
+-- Active scored events retain their normal end grace; this handles the
+-- teleport/menu path which never opened a music handoff.
+function jukebox.shadow_event_exit()
+    local zone = AshitaCore:GetMemoryManager():GetParty():GetMemberZone(0);
+    local player = GetPlayerEntity();
+    if (zone ~= 165 or is_zoning or player == nil) then
+        jukebox.shadow_was_event = false;
+        return false;
+    end
+    local in_event = (player.StatusServer or 0) == 4;
+    local leaving = jukebox.shadow_was_event and not in_event;
+    jukebox.shadow_was_event = in_event;
+    if (leaving and not handoff.active and not jukebox.active) then
+        return jukebox.shadow_prime_engine('event exit');
+    end
+    return false;
+end
+
 function jukebox.is_covered_engine_track(song)
     if (song == nil or song <= 0) then return false; end
     local addon_owns_zone = false;
@@ -2981,6 +3156,7 @@ function jukebox.is_covered_engine_track(song)
             AshitaCore:GetMemoryManager():GetParty():GetMemberZone(0));
     end);
     if (not addon_owns_zone) then return false; end
+    if (jukebox.shadow_covers(song) or jukebox.shadow_native_covers(song)) then return true; end
     local rd, rn = saved_bgm_ids.day, saved_bgm_ids.night;
     if (((rd ~= nil) and (song == rd)) or ((rn ~= nil) and (song == rn))) then
         return true;
@@ -3001,10 +3177,13 @@ end
 local function end_handoff(resume_wav)
     -- Inside a Mog House the city track is parked under moghouse.wav; the
     -- next update_music tick restarts moghouse.wav instead.
-    if (resume_wav and zone_is_paused and not jukebox.moghouse_owns_audio()) then
+    if (resume_wav and zone_is_paused and not jukebox.moghouse_owns_audio()
+        and jukebox.shadow_track() == nil) then
         resume_zone_music_fast();
     end
     engine_silence();
+    jukebox.shadow_lock_intro();
+    jukebox.shadow_prime_engine('handoff end');
     handoff.active = false;
     handoff.saw_event = false;
     handoff.end_grace = 0;
@@ -3022,6 +3201,7 @@ end
 -- that never touches the wire).
 local function begin_handoff(reason)
     if (handoff.active) then return; end
+    handoff.shadow_song = nil;
     -- Event music wins over a jukebox preview. Stop it without resuming live
     -- music; the handoff below decides what happens to the zone track.
     if (jukebox.active) then jukebox.stop(false); end
@@ -3095,6 +3275,7 @@ local function poll_engine_signal()
             pcall(function() zid = AshitaCore:GetMemoryManager():GetParty():GetMemberZone(0) or 0; end);
             zm_debug(string.format('Engine started music %d (zone %d)', music_id, zid));
         end
+        jukebox.shadow_note_intro(music_id);
         -- Track 0 is the engine's silence slot; ignore.
         if (music_id == 0) then return; end
         -- Only react when the WAV actually owns audio here; engine-native
@@ -3117,7 +3298,7 @@ local function poll_engine_signal()
                 end);
                 local mh_track = (music_id == 126)
                     or (moghouse_zone_flag == true and music_id == jukebox.mh_native_song);
-                if (mh_track or not in_event) then
+                if (mh_track or jukebox.shadow_covers(music_id) or jukebox.shadow_native_covers(music_id) or not in_event) then
                     -- Keep the WAV; re-silence the engine's day/night slots
                     -- (what end_handoff did after the 4s detour), at most
                     -- once per engine_signal.resilence_interval.
@@ -3131,6 +3312,11 @@ local function poll_engine_signal()
                         else
                             inject_engine_music(0, ENGINE_SILENCE_ID);
                             inject_engine_music(1, ENGINE_SILENCE_ID);
+                            if (jukebox.shadow_covers(music_id) or jukebox.shadow_native_covers(music_id, 2)
+                                or jukebox.shadow_native_covers(music_id, 3)) then
+                                inject_engine_music(2, ENGINE_SILENCE_ID);
+                                inject_engine_music(3, ENGINE_SILENCE_ID);
+                            end
                         end
                     end
                     if (DEBUG_CUTSCENE) then
@@ -3215,6 +3401,7 @@ local function play_zone_music(track)
     zone_is_paused = false;
     current_zone_track = track;
     current_zone_track_display = resolved_track;
+    if (DEBUG_CUTSCENE) then zm_debug('Zone track started: ' .. resolved_track); end
     
     -- Start fade in if enabled
     if (music_config.enable_fade) then
@@ -3321,6 +3508,7 @@ local function play_battle_music(track)
     battle_is_playing = true;
     current_battle_track = track;
     current_battle_track_display = resolved_track;
+    if (DEBUG_CUTSCENE) then zm_debug('Battle track started: ' .. resolved_track); end
 
     -- The addon is now playing its own battle cover (e.g. eald_narche_battle.wav
     -- or battle_163_party.wav). The engine may still be playing a .bgw on one of
@@ -3585,6 +3773,10 @@ end
 
 -- Clear event/cutscene tracking. Shared by the logout paths in update_music.
 function jukebox.reset_event_tracking()
+    jukebox.shadow:reset();
+    jukebox.shadow_reset_intro();
+    jukebox.shadow_poll = nil;
+    jukebox.shadow_was_event = false;
     status4_start_time = 0;
     in_cutscene_from_packet = false;
     packet_event_pending_start = 0;
@@ -3706,6 +3898,15 @@ local function update_music()
         -- is what would have caught it.)
         if ((not handoff.active) and in_status4 and is_cinematic_zone(current_zone_id)) then
             begin_handoff('SS=4 in cinematic zone ' .. tostring(current_zone_id));
+        end
+
+        -- A battle stream can open just before the boss becomes engaged.
+        -- Reclaim that orphan handoff immediately once its cover is ready;
+        -- genuine event windows still use the existing event-end grace.
+        if (handoff.active and not in_status4 and not handoff.saw_event
+            and (jukebox.shadow_covers(handoff.shadow_song or engine_signal.last_music)
+                or jukebox.shadow_native_covers(handoff.shadow_song or engine_signal.last_music))) then
+            end_handoff(false);
         end
 
         if (handoff.active) then
@@ -3899,7 +4100,8 @@ local function update_music()
     -- ends, zone music resumes from the same position. Battle and fishing
     -- are mutually exclusive at the player-status level (you can't fight
     -- and fish simultaneously), so reusing the channel is safe.
-    local is_battle_track = (string.find(desired_track, "battle_") ~= nil) 
+    local is_battle_track = (string.find(desired_track, "battle_") ~= nil)
+                         or (desired_track:match("_battle%.wav$") ~= nil)
                          or (string.find(desired_track, "lowhp") ~= nil)
                          or (string.find(desired_track, "nm") ~= nil)
                          or (string.find(desired_track, "fishing") ~= nil)
@@ -5416,6 +5618,13 @@ jukebox.ui = {
 -- 7. Loops
 local timer = 0;
 ashita.events.register('d3d_present', 'bard_music_tick', function ()
+    local ok, leaving_event = pcall(jukebox.shadow_event_exit);
+    if (not ok) then
+        jukebox.report_error('event exit', leaving_event);
+    elseif (leaving_event and not jukebox.active) then
+        timer = os.clock();
+        jukebox.guard('music event exit', update_music);
+    end
     jukebox.guard('engine signal', poll_engine_signal);
     jukebox.guard('idle replay', update_idle_replay);
     -- Update fades every frame (state-only, no MCI calls)
@@ -5572,6 +5781,16 @@ end);
 -- ASSESSMENT MESSAGES (do NOT change state — mid-fight commentary):
 --   "You have a good/bad/terrible feeling about this one"
 --   "You're fairly sure you don't have enough skill"
+
+ashita.events.register('text_in', 'zonemusic_shadow_text', function(e)
+    if (e == nil or type(e.message) ~= 'string') then return; end
+    if (AshitaCore:GetMemoryManager():GetParty():GetMemberZone(0) ~= 165) then return; end
+    local msg = e.message;
+    if (msg.strip_colors) then msg = msg:strip_colors(); end
+    if (msg.strip_translate) then msg = msg:strip_translate(true); end
+    jukebox.shadow:message(msg, os.clock());
+    jukebox.shadow_poll = nil;
+end);
 
 ashita.events.register('text_in', 'zonemusic_fishing_text', function(e)
     if (not music_config.enable_fishing) then return; end
@@ -5791,6 +6010,7 @@ ashita.events.register('packet_in', 'zonemusic_packet_in', function(e)
 
         if (not e.injected) then
             engine_05f_seen_time = os.clock();
+            jukebox.shadow_note_intro(song);
 
             -- Mog House slot (block 6) from the server, e.g. Symphonic
             -- Curator. Remember it as the native track for restore; while
@@ -5836,7 +6056,8 @@ ashita.events.register('packet_in', 'zonemusic_packet_in', function(e)
                 and (music_config.enable_moghouse ~= false)
                 and file_exists("moghouse.wav");
 
-            if (is_resident_resend or is_covered_moghouse) then
+            if (is_resident_resend or is_covered_moghouse or jukebox.shadow_covers(song, mtype)
+                or jukebox.shadow_native_covers(song, mtype)) then
                 e.blocked = true;
                 if (DEBUG_CUTSCENE) then
                     zm_debug(string.format(
@@ -5846,6 +6067,7 @@ ashita.events.register('packet_in', 'zonemusic_packet_in', function(e)
             else
                 begin_handoff(string.format(
                     'genuine 0x05F event music (type=%d song=%d)', mtype, song));
+                handoff.shadow_song = song;
             end
         else
             if (DEBUG_CUTSCENE) then
@@ -5884,6 +6106,10 @@ ashita.events.register('packet_in', 'zonemusic_packet_in', function(e)
     --                     logout debounce uses the long timeout instead
     --                     of treating the gap as a real logout.
     if (e.id == 0x00A) then
+        jukebox.shadow:reset();
+        jukebox.shadow_reset_intro();
+        jukebox.shadow_poll = nil;
+        jukebox.shadow_was_event = false;
         -- Wipe the previous zone's resident ids, then load any STORED ids
         -- for the incoming zone (reload-survival fallback). The fresh packet
         -- capture in suppress_engine_bgm_in_zone_packet overwrites both.
@@ -5944,6 +6170,9 @@ ashita.events.register('packet_in', 'zonemusic_packet_in', function(e)
         return;
     end
     if (e.id == 0x00B) then
+        jukebox.shadow:reset();
+        jukebox.shadow_reset_intro();
+        jukebox.shadow_poll = nil;
         handoff.active = false;
         handoff.saw_event = false;
         handoff.end_grace = 0;
