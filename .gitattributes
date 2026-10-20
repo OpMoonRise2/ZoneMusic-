@@ -3,3 +3,7 @@
 .gitignore text eol=lf
 .gitattributes text eol=lf
 *.dll binary
+*.cpp text eol=lf
+*.h text eol=lf
+*.def text eol=lf
+*.txt text eol=lf

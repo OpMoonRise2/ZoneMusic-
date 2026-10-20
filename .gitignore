@@ -21,3 +21,5 @@ __pycache__/
 .DS_Store
 Thumbs.db
 .vscode/
+# Helper plugin build output.
+/helper/build/

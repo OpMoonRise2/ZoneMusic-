@@ -8,7 +8,7 @@ The 2026-10-18 handover investigation identified missing resident/battle IDs aft
 
 The author confirmed final live behavior after testing teleport exit, encounter handover and the phase transitions. Automated actual-function regressions cover both phases, entity gaps, re-engagement, missing assets, settings gates, death, other zones, native packets/helper signals, genuine events, nil-ID reload recovery, intro replay and reset. Available compiler checks keep the maximum per-function upvalue count at 59. Any further playback/handover edit needs focused live regression, including fades and interaction with voice ducking; the existing encounter confirmation is not a test of every zone/cutscene.
 
-Preserve character settings. Never ship captured runtime signals, personal logs/configuration, recovery backups or Git internals. Debug captures and rollback source from this work are stored outside the repository. The helper DLL is unchanged from upstream; its build source is not available in this repository. Preserve original attribution and existing license terms.
+Preserve character settings. Never ship captured runtime signals, personal logs/configuration, recovery backups or Git internals. Debug captures and rollback source from this work are stored outside the repository. The helper DLL's complete source lives in `helper/`; rebuild `ZMHelper.dll` from it for every helper change so the published binary always matches the published source. Preserve original attribution and existing license terms.
 
 
 ## Release 2.0.2: Tenzen trust correction

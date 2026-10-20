@@ -1,0 +1,5 @@
+LIBRARY "ZMHelper.dll"
+EXPORTS
+	expCreatePlugin @1
+	expGetInterfaceVersion @2
+	expDestroyPlugin @3

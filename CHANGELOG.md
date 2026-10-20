@@ -1,5 +1,11 @@
 # Changelog
 
+## Helper source — 2026-10-20
+
+- Published the complete ZMHelper 1.1 build source in `helper/` (CMake project, vendored Microsoft Detours under MIT; Ashita SDK headers come from your Ashita install).
+- Rebuilt `ZMHelper.dll` from that source so the published binary matches the published source. Hooks, signal format and chat messages are unchanged; the Lua files are unchanged.
+- Added a "How it works" section to the README listing every packet, memory read and file the addon touches.
+
 ## 2.0.2 — 2026-10-18
 
 - Restricted Tenzen boss music to the engaged mission encounter in Sealion's Den; the same-named party trust no longer selects his boss theme.
