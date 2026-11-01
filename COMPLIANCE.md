@@ -28,4 +28,4 @@ The release-tag snapshot above predates these external-page edits. The existing 
 
 ## Nexus file cleanup (2026-11-01)
 
-All superseded Nexus files were moved to Nexus's archived category. This includes the old Lua-only downloads, the standalone ZMHelper download and older full packages. Nothing was deleted. The current 2.0.2 full package stays listed for its optional audio until an audio-only replacement is uploaded. Its file description tells users to copy only the audio and ignore the bundled Lua and DLL.
+All superseded Nexus files were moved to Nexus's archived category. This includes the old Lua-only downloads, the standalone ZMHelper download and older full packages. Nothing was deleted. The 2.0.2 full package was then replaced as the primary file by an audio-only ZoneMusic Sound Pack and archived. The sound pack contains only addons/zonemusic/sounds/ (431 MP3) and polplugins/DATs/zonemusicDATS/ (65 BGW, 7 WAV). It contains no Lua, DLL or settings files.
