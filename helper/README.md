@@ -1,6 +1,6 @@
 # ZMHelper — ZoneMusic engine-music sentinel
 
-Ashita v4 plugin, version 1.1. This folder is the complete source of the `ZMHelper.dll` shipped in the repository root.
+Ashita v4 plugin, version 1.1. This folder contains the published source accompanying the existing `ZMHelper.dll` in the repository root. A Win32 Release build succeeds; exact correspondence to the existing binary is not independently established. See [verification state](../COMPLIANCE.md).
 
 ## What it does
 
@@ -21,7 +21,7 @@ Detours chains hooks, so ZMHelper and XIPivot can both hook the same functions s
 
 ## Build
 
-Requires Visual Studio 2022 (MSVC, C++20) and CMake 3.15+. Build 32-bit; FFXI is a 32-bit client. The Ashita SDK headers ship with Ashita in `<Ashita>/plugins/sdk`.
+Requires Visual Studio with MSVC C++20 and CMake supporting your Visual Studio generator. Visual Studio 2026 with CMake 4.4.0-rc2 was used for the 2026-11-01 build check; Visual Studio 2022 is the historical build target. Build 32-bit; FFXI is a 32-bit client. The Ashita SDK headers ship with Ashita in `<Ashita>/plugins/sdk`.
 
 ```
 cmake -B build -A Win32 -DASHITA_SDK_DIR="<Ashita>/plugins/sdk"
@@ -35,3 +35,5 @@ Output: `build/Release/ZMHelper.dll`. Copy it to `<Ashita>/plugins/` and load it
 - Microsoft Detours is vendored in `deps/detours` under the MIT license (`deps/detours/license.md`).
 - The hook layer follows XIPivot by Renee Koecher, which established which file APIs FFXI's music streaming uses.
 - The Ashita SDK headers are LGPL-3.0 and are not vendored; they come from your Ashita install.
+
+For Visual Studio 2026, configure from this helper directory with `cmake -B build -G "Visual Studio 18 2026" -A Win32 -DASHITA_SDK_DIR="<Ashita>/plugins/sdk"`, then build as above. Use a CMake version that lists this generator. The required SDK is external and is not included in this repository or ZIP.

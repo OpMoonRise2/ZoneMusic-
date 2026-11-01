@@ -14,3 +14,8 @@ Preserve character settings. Never ship captured runtime signals, personal logs/
 ## Release 2.0.2: Tenzen trust correction
 
 The simple boss scan matched any engaged entity named Tenzen, including the party trust. His override now requires zone 32, a known entity server ID, and exclusion from the party's server IDs; the existing engagement check still applies. The string mapping remains unchanged for the music catalog. Actual-selector regressions cover a trust in party slot 1 both inside/outside the mission zone, non-party Tenzen outside the zone, engaged mission Tenzen, unknown/unengaged entities, and another boss. All previous Shadow Lord tests pass. The author confirmed the fix in live testing. Release 2.0.2 includes this correction; existing 2.0.1 ZIPs predate it. Automated mission-boss selection passes; this does not claim a new live mission-fight test beyond the author's reported confirmation.
+
+
+## GitHub addon publication (2026-11-01)
+
+README now directs addon installation to the named GitHub Release ZIP and identifies Nexus as optional audio only. Screenshots supplied by the author are in docs/screenshots. Preserve this separation for future releases. See COMPLIANCE.md for current evidence, verification limits and outstanding external-site work. Runtime source is unchanged.
