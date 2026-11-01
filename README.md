@@ -10,7 +10,7 @@ Download **ZoneMusic-2.0.2-addon.zip** from [GitHub Releases](https://github.com
 2. Extract the ZIP into your Ashita folder. It already has `addons/` and `plugins/` folders; do not extract it inside `addons/zonemusic/`.
 3. Confirm `addons/zonemusic/` contains `zonemusic.lua`, `zm_ui.lua`, `zm_doctor.lua`, and `zm_shadow.lua`. The helper belongs at `plugins/ZMHelper.dll`.
 4. Supply permitted MP3/WAV recordings in `addons/zonemusic/sounds/`, or install an optional audio pack below. The code ZIP alone provides no replacement recordings.
-5. Load `/load ZMHelper`, then `/addon load zonemusic`. Open settings with `/zm`; use `/zm doctor` for installation checks. The helper improves native cutscene-music detection; see its [source and build instructions](helper/README.md).
+5. Load `/load ZMHelper`, then `/addon load zonemusic`. Open settings with `/zm`; use `/zm doctor` for installation checks. ZMHelper is required. Without it, cutscene music can play over the field music. Add `/load ZMHelper` to your Ashita boot script so it loads every time. See its [source and build instructions](helper/README.md).
 
 Use the named addon ZIP for direct installation. The automatic GitHub source archives use the repository layout and are intended for source review.
 
@@ -18,7 +18,7 @@ Use the named addon ZIP for direct installation. The automatic GitHub source arc
 
 The [optional ZoneMusic audio pack on Nexus Mods](https://www.nexusmods.com/finalfantasy11/mods/34) is separate from the addon. Download the addon itself from GitHub. You may instead supply your own audio using the filenames mapped in `zonemusic.lua`. Missing recordings cannot play.
 
-Copy only the pack's `sounds/` content into `addons/zonemusic/sounds/`. Do not overwrite newer GitHub addon code with files from an older audio archive. Optional native sound DAT overlays are a separate component outside this GitHub release. If using a permitted overlay, place it under `polplugins/DATs/zonemusicDATS/` and add `zonemusicDATS` to your existing Pivot overlay list without removing other entries. No recording or DAT rights are granted by this repository.
+Extract the sound pack into your Ashita folder. It adds `addons/zonemusic/sounds/` and `polplugins/DATs/zonemusicDATS/` and contains no addon code. Then add `zonemusicDATS` to your existing XIPivot overlay list without removing other entries. If you supply your own recordings, use those same folders. No recording or DAT rights are granted by this repository.
 
 ## Screenshots
 
@@ -39,7 +39,7 @@ ZoneMusic replaces the music you hear. It does not change anything the server se
   - Incoming `0x00A` (zone-in): zeroes the five background-music slots in zones that have a cover track.
   - Incoming `0x05F` (music change): blocks the packet when the server resends a track that a cover already replaces (resident zone track, Mog House).
   - Injected incoming `0x05F`: silences or restores the game's own music slots when a cover starts or stops.
-- **Handing music back for cutscenes.** It watches incoming `0x032`/`0x033`/`0x034` (event start), `0x052` (event release) and `0x00B` (zone-out) to pause its cover and let native cutscene music play. The optional ZMHelper plugin reports client-side cutscene scores that never arrive as packets. See [helper/README.md](helper/README.md).
+- **Handing music back for cutscenes.** It watches incoming `0x032`/`0x033`/`0x034` (event start), `0x052` (event release) and `0x00B` (zone-out) to pause its cover and let native cutscene music play. The required ZMHelper plugin reports client-side cutscene scores that never arrive as packets. Without it, those cutscenes play over the field music. See [helper/README.md](helper/README.md).
 - **Chat text.** It reads incoming chat lines only to recognise the Shadow Lord phase change and fishing.
 - **Files.** It writes its settings, reads the ZMHelper signal file, and reads/writes `voice_duck_signal.txt` to lower music while BeastVoice or SCVoice speak. `dir /b` is used only to list audio files in `sounds/`.
 - **Commands.** `/zm` and `/zonemusic` open the GUI and change settings; those handlers block only the addon's own slash commands.
