@@ -17,7 +17,7 @@ ZoneMusic polls that file; a counter change means "the client just started track
 
 On load it uses Microsoft Detours to attach observers to `fopen_s`, `_fsopen` and `fopen` in each loaded C runtime, and to kernel32 `CreateFileA`. Every hook calls the original function first and returns its result unchanged. When the opened path is a `.bgw` file under a `music` folder, the hook writes the signal file. ZMHelper never alters paths, file contents or results, sends nothing to the server, reads no game memory and registers no commands. Unloading (`/unload zmhelper`) removes every hook.
 
-Detours chains hooks, so ZMHelper and XIPivot can both hook the same functions safely, in any load order.
+Detours chains hooks, so ZMHelper and XIPivot are designed to hook the same functions side by side. Not every load order has been tested.
 
 ## Build
 
